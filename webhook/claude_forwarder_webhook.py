@@ -192,16 +192,25 @@ def launch_in_tmux(session_name, prompt, test_mode=False):
             f"--dangerously-skip-permissions \"$(cat '{prompt_path}')\""
         )
 
-    # Launcher: run the work, then record the exit code for status polling
+    # Launcher: run the work, then record the exit code for status polling.
+    # OAuth refresh can transiently fail when another Claude instance
+    # rotates the token at the same moment — retry ONLY on that signature
+    # (an auth failure means no work was done, so retrying is safe).
     launcher_fd = tempfile.NamedTemporaryFile(
         mode="w", suffix=".sh", delete=False, prefix="claude-fwd-"
     )
     launcher_fd.write(f"""#!/bin/bash
 cd {WORKSPACE_DIR}
-{{
+LOG='{JOBS_DIR}/{session_name}.log'
+for ATTEMPT in 1 2 3; do
+  {{
 {work_cmd}
-}} > '{JOBS_DIR}/{session_name}.log' 2>&1
-EXIT=$?
+  }} > "$LOG" 2>&1
+  EXIT=$?
+  [ $EXIT -eq 0 ] && break
+  grep -q "Failed to authenticate" "$LOG" || break
+  [ $ATTEMPT -lt 3 ] && sleep $((ATTEMPT * 20))
+done
 echo $EXIT > '{JOBS_DIR}/{session_name}.exit'
 rm -f '{prompt_path}' '{launcher_fd.name}'
 exit $EXIT
