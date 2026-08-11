@@ -39,9 +39,9 @@
           body: textEl ? textEl.innerText.trim() : "(hover preview)",
           timestamp: msgTs,
         }];
-        result.hint = hasReplies
-          ? "This message has replies. Use slack_read_thread MCP tool to fetch full thread."
-          : "This is a single message. Use slack_read_thread MCP tool if it has replies.";
+        result.hint =
+          "Always fetch the complete thread with slack_read_thread MCP before acting" +
+          (hasReplies ? " — this message has replies." : " — replies may exist beyond this preview.");
         return result;
       }
     }

@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
 Claude Code Forwarder Webhook
-Receives forwarded Gmail/Slack threads from Chrome extension,
-spawns Claude Code CLI sessions in tmux for Claude Island integration.
+Receives forwarded Gmail/Slack threads and Plaud recordings from the Chrome
+extension, spawns headless Claude Code CLI sessions in tmux, and tracks their
+lifecycle (running / done / error / terminated) for the menu bar app.
 
 Usage:
   pip install -r requirements.txt
   python claude_forwarder_webhook.py
+
+Environment overrides:
+  PORT                webhook port                  (default 5581)
+  FORWARDER_WORKSPACE Claude Code working directory (default ~/claude)
+  FORWARDER_MODEL     model for spawned sessions    (default opus)
+  FORWARDER_EFFORT    effort for spawned sessions   (default high)
 """
 
 import os
+import re
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from flask import Flask, request, jsonify
 
@@ -33,8 +43,29 @@ def handle_preflight():
     return "", 204
 
 
-WORKSPACE_DIR = os.path.expanduser("~/claude")
-active_jobs = {}
+WORKSPACE_DIR = os.path.expanduser(
+    os.environ.get("FORWARDER_WORKSPACE", "~/claude")
+)
+
+# Forwarded threads get the strongest setup by default.
+# Override per-machine with FORWARDER_MODEL / FORWARDER_EFFORT.
+CLAUDE_MODEL = os.environ.get("FORWARDER_MODEL", "opus")
+CLAUDE_EFFORT = os.environ.get("FORWARDER_EFFORT", "high")
+
+# Per-job artifacts: <session>.exit (exit code) and <session>.log (output)
+JOBS_DIR = "/tmp/claude-forwarder-jobs"
+
+# How long finished jobs stay listed in /status (menu bar history)
+FINISHED_TTL = 6 * 3600
+
+VALID_SOURCES = ("gmail", "slack", "plaud")
+
+active_jobs = {}    # job_id -> job dict, status == "running"
+finished_jobs = {}  # job_id -> job dict, status in ("done","error","terminated")
+
+# Flask serves requests on multiple threads; the menu bar polls /status
+# while /terminate mutates the same dicts — serialize all job bookkeeping
+jobs_lock = threading.Lock()
 
 
 def build_prompt(payload):
@@ -64,17 +95,20 @@ def build_prompt(payload):
         thread_id_line = f"Slack Thread ID: channel={thread_id['channel_id']}, thread_ts={thread_id['thread_ts']}\n"
     if gmail_thread_id:
         thread_id_line += f"Gmail Thread ID: {gmail_thread_id}\n"
+    plaud_file_id = payload.get("plaud_file_id")
+    if not plaud_file_id and source == "plaud" and url:
+        m = re.search(r"/file/([0-9a-f]{16,})", url, re.IGNORECASE)
+        if m:
+            plaud_file_id = m.group(1)
+    if plaud_file_id:
+        thread_id_line += f"Plaud File ID: {plaud_file_id}\n"
     if hint:
         thread_id_line += f"Hint: {hint}\n"
-
-    subject_line = ""
-    if payload.get("subject"):
-        subject_line = f"Subject: {payload['subject']}\n"
 
     if not instruction:
         instruction = "Auto — 根據內容和你的 skills 決定怎麼處理"
 
-    # Build a clear header for Claude Island preview
+    # Build a clear header for status displays
     # Extract key info: who sent it, what channel, first line of content
     subject = payload.get("subject", "")
     first_sender = ""
@@ -98,6 +132,8 @@ def build_prompt(payload):
         header = subject or "Gmail"
         if first_sender:
             header += f" (from {first_sender})"
+    elif source == "plaud":
+        header = subject or "Plaud recording"
     else:
         header = subject or f"Forwarded {source}"
 
@@ -115,12 +151,28 @@ Source: {source} | URL: {url}
 User instruction: {instruction}
 
 Act on this using your existing skills. If it's an email, draft a reply via Gmail.
-If it's a Slack message, research and draft a response via Slack.
+If it's a Slack message, ALWAYS fetch the complete thread first with the
+slack_read_thread MCP tool using the Slack Thread ID above — the thread content
+above comes from the DOM and may be truncated (Slack virtualizes long threads).
+Never act on the partial content alone. Then research and draft a response via
+Slack.
+If it's a Plaud recording, first read skills/plaud.md, then fetch the full
+content via the plaud MCP using the Plaud File ID above — get_note for the AI
+summary, get_transcript only when verbatim wording matters. Any page text in
+the thread content above is a partial DOM preview; never treat it as the full
+transcript. Then act on the content (action items, follow-ups, drafts).
 Always use the draft-first pattern — never send directly."""
 
 
-def launch_in_tmux(session_name, prompt):
-    """Write prompt to temp file, launch claude in a tmux session."""
+def launch_in_tmux(session_name, prompt, test_mode=False):
+    """Write prompt to temp file, launch headless claude in a tmux session.
+
+    claude runs in print mode (-p): it works the task autonomously, then
+    exits. Exit code lands in JOBS_DIR/<session>.exit, output in .log —
+    that's what /status and the menu bar app read. Nobody attaches to
+    these sessions; tmux is just a detach + kill handle.
+    """
+    os.makedirs(JOBS_DIR, exist_ok=True)
 
     # Write prompt to temp file (avoids shell escaping issues)
     prompt_fd = tempfile.NamedTemporaryFile(
@@ -130,21 +182,35 @@ def launch_in_tmux(session_name, prompt):
     prompt_fd.close()
     prompt_path = prompt_fd.name
 
-    # Write launcher script that runs claude then cleans up
+    if test_mode:
+        # Install smoke test: no claude involved, finishes in a few seconds
+        work_cmd = "sleep 5; echo 'forwarder test job OK'"
+    else:
+        work_cmd = (
+            f'claude -p --name "{session_name}" '
+            f"--model {CLAUDE_MODEL} --effort {CLAUDE_EFFORT} "
+            f"--dangerously-skip-permissions \"$(cat '{prompt_path}')\""
+        )
+
+    # Launcher: run the work, then record the exit code for status polling
     launcher_fd = tempfile.NamedTemporaryFile(
         mode="w", suffix=".sh", delete=False, prefix="claude-fwd-"
     )
     launcher_fd.write(f"""#!/bin/bash
 cd {WORKSPACE_DIR}
-claude --name "{session_name}" --dangerously-skip-permissions "$(cat '{prompt_path}')"
+{{
+{work_cmd}
+}} > '{JOBS_DIR}/{session_name}.log' 2>&1
+EXIT=$?
+echo $EXIT > '{JOBS_DIR}/{session_name}.exit'
 rm -f '{prompt_path}' '{launcher_fd.name}'
+exit $EXIT
 """)
     launcher_fd.close()
     launcher_path = launcher_fd.name
     os.chmod(launcher_path, stat.S_IRWXU)
 
-    # Launch in a new tmux session
-    # set-option destroy-unattached so tmux auto-kills when claude exits
+    # Launch in a new tmux session (detached; auto-dies when launcher exits)
     process = subprocess.Popen(
         [
             "tmux", "new-session", "-d",
@@ -158,32 +224,127 @@ rm -f '{prompt_path}' '{launcher_fd.name}'
     return process
 
 
+def tmux_session_alive(session_name):
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", session_name],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def list_forwarder_tmux_sessions():
+    """All live tmux sessions named fwd-* (for orphan recovery)."""
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [s for s in result.stdout.splitlines() if s.startswith("fwd-")]
+
+
+def refresh_jobs():
+    """Move exited jobs to finished with done/error status; recover orphans.
+
+    Callers must hold jobs_lock.
+    """
+    now = time.time()
+
+    # 1. Active jobs whose tmux session is gone → finished
+    for job_id in list(active_jobs.keys()):
+        job = active_jobs[job_id]
+        if tmux_session_alive(job["session_name"]):
+            continue
+        exit_path = os.path.join(JOBS_DIR, job["session_name"] + ".exit")
+        exit_code = None
+        try:
+            with open(exit_path) as f:
+                exit_code = int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+        job["ended_at"] = now
+        job["exit_code"] = exit_code
+        if job.get("status") == "terminating":
+            job["status"] = "terminated"
+        elif exit_code == 0:
+            job["status"] = "done"
+        else:
+            job["status"] = "error"
+        finished_jobs[job_id] = job
+        active_jobs.pop(job_id, None)
+
+    # 2. Orphaned fwd-* tmux sessions (webhook restarted mid-job) → adopt
+    known = {j["session_name"] for j in active_jobs.values()}
+    for session_name in list_forwarder_tmux_sessions():
+        if session_name in known:
+            continue
+        job_id = session_name.rsplit("-", 1)[-1]
+        parts = session_name.split("-")
+        active_jobs[job_id] = {
+            "source": parts[1] if len(parts) >= 3 else "unknown",
+            "url": "",
+            "subject": "(recovered after webhook restart)",
+            "session_name": session_name,
+            "tmux_session": session_name,
+            "status": "running",
+            "started_at": now,
+        }
+
+    # 3. Expire old finished jobs
+    for job_id in list(finished_jobs.keys()):
+        if now - finished_jobs[job_id].get("ended_at", now) > FINISHED_TTL:
+            del finished_jobs[job_id]
+
+
+def public_job(job_id, job):
+    out = {
+        "job_id": job_id,
+        "source": job.get("source"),
+        "subject": job.get("subject") or "",
+        "url": job.get("url", ""),
+        "session_name": job["session_name"],
+        "status": job.get("status", "running"),
+        "started_at": job.get("started_at"),
+        "log_path": os.path.join(JOBS_DIR, job["session_name"] + ".log"),
+    }
+    if job.get("ended_at"):
+        out["ended_at"] = job["ended_at"]
+    if job.get("exit_code") is not None:
+        out["exit_code"] = job["exit_code"]
+    return out
+
+
 @app.route("/forward", methods=["POST"])
 def forward():
     payload = request.get_json(silent=True)
     if not payload:
         return jsonify({"ok": False, "error": "Missing JSON body"}), 400
 
-    source = payload.get("source")
-    if source not in ("gmail", "slack"):
-        return jsonify({"ok": False, "error": "source must be 'gmail' or 'slack'"}), 400
+    test_mode = bool(payload.get("_test"))
+    source = payload.get("source", "test" if test_mode else None)
+    if not test_mode and source not in VALID_SOURCES:
+        return jsonify({"ok": False, "error": f"source must be one of {VALID_SOURCES}"}), 400
 
     url = payload.get("url", "")
-    if not url and not payload.get("thread"):
+    if not test_mode and not url and not payload.get("thread"):
         return jsonify({"ok": False, "error": "Must provide url or thread content"}), 400
 
-    prompt = build_prompt(payload)
+    prompt = "" if test_mode else build_prompt(payload)
     job_id = str(uuid.uuid4())[:8]
     session_name = f"fwd-{source}-{job_id}"
 
-    process = launch_in_tmux(session_name, prompt)
+    launch_in_tmux(session_name, prompt, test_mode=test_mode)
 
-    active_jobs[job_id] = {
-        "source": source,
-        "url": url,
-        "session_name": session_name,
-        "tmux_session": session_name,
-    }
+    with jobs_lock:
+        active_jobs[job_id] = {
+            "source": source,
+            "url": url,
+            "subject": payload.get("subject") or payload.get("instruction") or "",
+            "session_name": session_name,
+            "tmux_session": session_name,
+            "status": "running",
+            "started_at": time.time(),
+        }
 
     return jsonify({
         "ok": True,
@@ -195,32 +356,58 @@ def forward():
 
 @app.route("/status", methods=["GET"])
 def status():
-    # Clean up finished tmux sessions
-    finished = []
-    for job_id, job in active_jobs.items():
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", job["tmux_session"]],
-            capture_output=True,
+    with jobs_lock:
+        refresh_jobs()
+        running = [public_job(jid, j) for jid, j in active_jobs.items()]
+        finished = sorted(
+            (public_job(jid, j) for jid, j in finished_jobs.items()),
+            key=lambda j: j.get("ended_at", 0),
+            reverse=True,
         )
-        if result.returncode != 0:
-            finished.append(job_id)
-    for job_id in finished:
-        del active_jobs[job_id]
-
     return jsonify({
         "ok": True,
-        "active_jobs": len(active_jobs),
-        "jobs": active_jobs,
+        "active_jobs": len(running),
+        "error_jobs": sum(1 for j in finished if j["status"] == "error"),
+        "running": running,
+        "finished": finished,
+        # Legacy shape (pre-1.3 clients)
+        "jobs": {j["job_id"]: j for j in running},
     })
+
+
+@app.route("/terminate/<job_id>", methods=["POST"])
+def terminate(job_id):
+    with jobs_lock:
+        refresh_jobs()
+        job = active_jobs.get(job_id)
+        if not job:
+            return jsonify({"ok": False, "error": f"No running job '{job_id}'"}), 404
+        job["status"] = "terminating"
+        subprocess.run(
+            ["tmux", "kill-session", "-t", job["session_name"]],
+            capture_output=True,
+        )
+        refresh_jobs()
+    return jsonify({"ok": True, "job_id": job_id, "status": "terminated"})
+
+
+@app.route("/clear-finished", methods=["POST"])
+def clear_finished():
+    with jobs_lock:
+        count = len(finished_jobs)
+        finished_jobs.clear()
+    return jsonify({"ok": True, "cleared": count})
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5581))
+    os.makedirs(JOBS_DIR, exist_ok=True)
     print("=" * 50)
     print("  Claude Code Forwarder Webhook")
     print("=" * 50)
     print(f"  Listening: http://localhost:{port}")
     print(f"  Workspace: {WORKSPACE_DIR}")
-    print(f"  Mode:      tmux + Claude Island")
+    print(f"  Model:     {CLAUDE_MODEL} (effort: {CLAUDE_EFFORT})")
+    print(f"  Jobs dir:  {JOBS_DIR}")
     print("=" * 50)
     app.run(host="127.0.0.1", port=port)

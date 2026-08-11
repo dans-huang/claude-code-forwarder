@@ -1,5 +1,27 @@
 const WEBHOOK_URL = "http://localhost:5581/forward";
 
+// Template prompts shown as quick-select buttons in the popup, in priority
+// order. Click one to fill the instruction box (still editable), then Enter
+// to send. Edit this list to customize.
+const TEMPLATES = [
+  {
+    label: "Research → Slack draft",
+    text: "Research this thoroughly, then draft a response right back in Slack for my later review. Draft only — never send.",
+  },
+  {
+    label: "Update QA dashboard",
+    text: "Update this task into the QA dashboard. Ensure highest clarity and reduce noise — keep only what matters, remove anything stale it supersedes.",
+  },
+  {
+    label: "Summarize + action items",
+    text: "Summarize this and extract action items: owner, what, by when. Flag anything that needs my decision.",
+  },
+  {
+    label: "Draft email reply",
+    text: "Research context as needed and draft a reply email for my later review. Draft only — never send.",
+  },
+];
+
 // Listen for keyboard shortcut (Cmd+Shift+F)
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "forward-to-claude") return;
@@ -11,10 +33,14 @@ chrome.commands.onCommand.addListener(async (command) => {
   let source = null;
   if (url.includes("mail.google.com")) source = "gmail";
   else if (url.includes("app.slack.com")) source = "slack";
+  else if (url.includes("web.plaud.ai")) source = "plaud";
   if (!source) return;
 
-  const scriptFile =
-    source === "gmail" ? "gmail-content.js" : "slack-content.js";
+  const scriptFile = {
+    gmail: "gmail-content.js",
+    slack: "slack-content.js",
+    plaud: "plaud-content.js",
+  }[source];
 
   try {
     // Capture selected text first
@@ -35,6 +61,8 @@ chrome.commands.onCommand.addListener(async (command) => {
       extracted = {
         thread: [{ from: "", body: selectedText, timestamp: "" }],
         subject: extracted?.subject || null,
+        plaud_file_id: extracted?.plaud_file_id || undefined,
+        hint: extracted?.hint || undefined,
         selectedOnly: true,
       };
     }
@@ -57,11 +85,11 @@ function showPopup(tabId, source, url, extracted) {
   chrome.scripting.executeScript({
     target: { tabId },
     func: injectInstructionPopup,
-    args: [source, url, extracted, WEBHOOK_URL],
+    args: [source, url, extracted, WEBHOOK_URL, TEMPLATES],
   });
 }
 
-function injectInstructionPopup(source, url, extracted, webhookUrl) {
+function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
   // Remove existing popup if any
   const existing = document.getElementById("claude-forwarder-popup");
   if (existing) existing.remove();
@@ -103,6 +131,16 @@ function injectInstructionPopup(source, url, extracted, webhookUrl) {
         font-size: 13px; color: #333; margin-bottom: 12px;
         padding: 8px; background: #f5f5f5; border-radius: 6px;
       }
+      .templates {
+        display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+      }
+      .tpl {
+        padding: 5px 10px; border: 1px solid #e5d5bd; border-radius: 14px;
+        background: #fdf8f0; color: #92600a; cursor: pointer;
+        font-size: 12px; font-family: inherit; line-height: 1.3;
+      }
+      .tpl:hover { background: #f7ecd9; }
+      .tpl.active { background: #D97706; border-color: #D97706; color: white; }
       textarea {
         width: 100%; height: 80px; border: 1px solid #ddd; border-radius: 8px;
         padding: 10px; font-size: 14px; resize: vertical;
@@ -139,8 +177,10 @@ function injectInstructionPopup(source, url, extracted, webhookUrl) {
           Source: <strong>${source}</strong> &middot; ${statusText}
         </div>
         ${extracted?.subject ? `<div class="subject">${extracted.subject}</div>` : ""}
+        <div class="templates" id="templates"></div>
         <textarea id="instruction" placeholder="Add instruction (e.g. draft reply, summarize, research this...)"></textarea>
         <div class="hints">
+          <span><kbd>1</kbd>–<kbd>${Math.min(templates?.length || 0, 9)}</kbd> template</span>
           <span><kbd>Enter</kbd> send</span>
           <span><kbd>Shift+Enter</kbd> new line</span>
           <span><kbd>Esc</kbd> cancel</span>
@@ -161,6 +201,39 @@ function injectInstructionPopup(source, url, extracted, webhookUrl) {
   const sendBtn = shadow.getElementById("send");
   const statusEl = shadow.getElementById("status");
   const textarea = shadow.getElementById("instruction");
+
+  // Template quick-select buttons
+  const tplRow = shadow.getElementById("templates");
+  const tplButtons = [];
+  (templates || []).forEach((tpl, i) => {
+    const btn = document.createElement("button");
+    btn.className = "tpl";
+    btn.textContent = (i < 9 ? `${i + 1} · ` : "") + tpl.label;
+    btn.title = tpl.text;
+    btn.addEventListener("click", () => selectTemplate(i));
+    tplRow.appendChild(btn);
+    tplButtons.push(btn);
+  });
+
+  function selectTemplate(i) {
+    const tpl = (templates || [])[i];
+    if (!tpl) return;
+    textarea.value = tpl.text;
+    tplButtons.forEach((b, j) => b.classList.toggle("active", i === j));
+    textarea.focus();
+  }
+
+  // Digit 1-9 picks a template while the instruction box is still empty
+  // or holds an unedited template (typing a real instruction disables it)
+  function digitPicksTemplate(e) {
+    if (e.key < "1" || e.key > "9" || e.metaKey || e.ctrlKey || e.altKey) return false;
+    const v = textarea.value;
+    if (v !== "" && !(templates || []).some((t) => t.text === v)) return false;
+    const i = parseInt(e.key, 10) - 1;
+    if (!(templates || [])[i]) return false;
+    selectTemplate(i);
+    return true;
+  }
 
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) host.remove();
@@ -204,6 +277,9 @@ function injectInstructionPopup(source, url, extracted, webhookUrl) {
       shadow.getElementById("send")?.click();
       return;
     }
+    if (e.type === "keydown" && digitPicksTemplate(e)) {
+      e.preventDefault();
+    }
     e.stopPropagation();
   }
   document.addEventListener("keydown", blockSlackKeys, true);
@@ -242,6 +318,7 @@ function injectInstructionPopup(source, url, extracted, webhookUrl) {
       if (extracted.thread) payload.thread = extracted.thread;
       if (extracted.thread_id) payload.thread_id = extracted.thread_id;
       if (extracted.gmail_thread_id) payload.gmail_thread_id = extracted.gmail_thread_id;
+      if (extracted.plaud_file_id) payload.plaud_file_id = extracted.plaud_file_id;
       if (extracted.hint) payload.hint = extracted.hint;
     }
 

@@ -3,6 +3,8 @@ set -e
 
 # ─────────────────────────────────────────────
 #  Claude Code Forwarder — One-Click Setup
+#  Installs: webhook service + menu bar app
+#  Manual:   Chrome extension (2 steps, guided)
 # ─────────────────────────────────────────────
 
 BOLD='\033[1m'
@@ -13,8 +15,13 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEBHOOK_DIR="$SCRIPT_DIR/webhook"
-PLIST_NAME="com.claude-code-forwarder.webhook"
-PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+MENUBAR_DIR="$SCRIPT_DIR/menubar"
+WEBHOOK_PLIST_NAME="com.claude-code-forwarder.webhook"
+MENUBAR_PLIST_NAME="com.claude-code-forwarder.menubar"
+WEBHOOK_PLIST_PATH="$HOME/Library/LaunchAgents/$WEBHOOK_PLIST_NAME.plist"
+MENUBAR_PLIST_PATH="$HOME/Library/LaunchAgents/$MENUBAR_PLIST_NAME.plist"
+VENV_DIR="$SCRIPT_DIR/.venv"
+PYTHON3="$VENV_DIR/bin/python3"
 
 echo ""
 echo -e "${BOLD}🚀 Claude Code Forwarder — Setup${NC}"
@@ -47,46 +54,35 @@ else
     echo -e "${GREEN}✓${NC} tmux"
 fi
 
-# ─── Install Claude Island ───────────────────
-if [ ! -d "/Applications/Claude Island.app" ]; then
-    echo -e "${YELLOW}Installing Claude Island...${NC}"
-    brew install --cask claude-island
-else
-    echo -e "${GREEN}✓${NC} Claude Island"
+# ─── Python venv + deps ──────────────────────
+# Own venv: avoids PEP 668 (externally-managed) errors on Homebrew Python
+if [ ! -x "$PYTHON3" ]; then
+    echo -e "${YELLOW}Creating Python venv...${NC}"
+    python3 -m venv "$VENV_DIR"
 fi
-
-# Launch Claude Island if not running
-if ! pgrep -f "Claude Island" &>/dev/null; then
-    open -a "Claude Island"
-    echo -e "${GREEN}✓${NC} Claude Island launched"
+if ! "$PYTHON3" -c "import flask, rumps" &>/dev/null; then
+    echo -e "${YELLOW}Installing Python deps (flask, rumps)...${NC}"
+    "$PYTHON3" -m pip install -q --upgrade pip
+    "$PYTHON3" -m pip install -q -r "$WEBHOOK_DIR/requirements.txt" -r "$MENUBAR_DIR/requirements.txt"
 fi
-
-# ─── Install Flask ───────────────────────────
-if ! python3 -c "import flask" &>/dev/null; then
-    echo -e "${YELLOW}Installing Flask...${NC}"
-    pip3 install flask
-else
-    echo -e "${GREEN}✓${NC} Flask"
-fi
+echo -e "${GREEN}✓${NC} Python deps (venv: $VENV_DIR)"
 
 # ─── Install webhook as launchd service ──────
 echo ""
 echo -e "${BOLD}Setting up webhook service...${NC}"
 
-# Stop existing service if running
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
+launchctl unload "$WEBHOOK_PLIST_PATH" 2>/dev/null || true
 
-# Create launchd plist
-cat > "$PLIST_PATH" << PLIST
+cat > "$WEBHOOK_PLIST_PATH" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${PLIST_NAME}</string>
+    <string>${WEBHOOK_PLIST_NAME}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$(command -v python3)</string>
+        <string>${PYTHON3}</string>
         <string>${WEBHOOK_DIR}/claude_forwarder_webhook.py</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -106,15 +102,66 @@ cat > "$PLIST_PATH" << PLIST
 </plist>
 PLIST
 
-# Start the service
-launchctl load "$PLIST_PATH"
+launchctl load "$WEBHOOK_PLIST_PATH"
 
-# Verify it's running
 sleep 2
 if curl -s http://localhost:5581/status | grep -q '"ok":true'; then
     echo -e "${GREEN}✓${NC} Webhook running on localhost:5581 (auto-starts on login)"
 else
     echo -e "${RED}✗${NC} Webhook failed to start. Check: /tmp/claude-forwarder-webhook.log"
+    exit 1
+fi
+
+# ─── Install menu bar app as launchd service ─
+echo ""
+echo -e "${BOLD}Setting up menu bar app...${NC}"
+
+launchctl unload "$MENUBAR_PLIST_PATH" 2>/dev/null || true
+
+cat > "$MENUBAR_PLIST_PATH" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${MENUBAR_PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${PYTHON3}</string>
+        <string>${MENUBAR_DIR}/claude_forwarder_menubar.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-forwarder-menubar.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-forwarder-menubar.log</string>
+</dict>
+</plist>
+PLIST
+
+launchctl load "$MENUBAR_PLIST_PATH"
+
+sleep 2
+if pgrep -f "claude_forwarder_menubar.py" &>/dev/null; then
+    echo -e "${GREEN}✓${NC} Menu bar app running — look for ✳ in your menu bar"
+else
+    echo -e "${RED}✗${NC} Menu bar app failed. Check: /tmp/claude-forwarder-menubar.log"
+    exit 1
+fi
+
+# ─── Smoke test ──────────────────────────────
+echo ""
+echo -e "${BOLD}Running smoke test...${NC}"
+RESP=$(curl -s -X POST http://localhost:5581/forward \
+    -H "Content-Type: application/json" -d '{"_test": true}')
+if echo "$RESP" | grep -q '"ok":true'; then
+    echo -e "${GREEN}✓${NC} Test job launched — watch ✳ in the menu bar show '✳ 1'"
+    echo "  then flip back to ✳ (done) within ~10 seconds"
+else
+    echo -e "${RED}✗${NC} Smoke test failed: $RESP"
     exit 1
 fi
 
@@ -160,13 +207,20 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}✅ Setup complete!${NC}"
 echo ""
-echo "  Usage: Open Gmail or Slack → Cmd+Shift+F"
+echo "  Usage: Open Gmail, Slack, or a Plaud recording → Cmd+Shift+F"
 echo ""
-echo "  • In a thread    → extracts full thread"
-echo "  • Hover a message → extracts that message"
-echo "  • Select text     → sends only the selection"
+echo "  • Gmail/Slack thread → extracts thread, full content via MCP"
+echo "  • Plaud recording    → file id via URL, transcript via plaud MCP"
+echo "  • Select text        → sends only the selection"
+echo "  • Pick a template button or type your own instruction"
 echo ""
-echo "  Sessions appear in Claude Island."
-echo "  Webhook auto-starts on login. To stop:"
-echo "    launchctl unload $PLIST_PATH"
+echo "  Jobs run headless (claude -p) — watch the ✳ menu bar item for"
+echo "  status; terminate from there if needed. No Claude Island required."
+echo ""
+echo "  Config (env vars in the webhook plist):"
+echo "    FORWARDER_MODEL=opus  FORWARDER_EFFORT=high  FORWARDER_WORKSPACE=~/claude"
+echo ""
+echo "  To stop everything:"
+echo "    launchctl unload $WEBHOOK_PLIST_PATH"
+echo "    launchctl unload $MENUBAR_PLIST_PATH"
 echo ""
