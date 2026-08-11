@@ -1,18 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Claude Code Forwarder",
-  "version": "1.3.0",
-  "description": "Cmd+Shift+F to forward Gmail/Slack threads or Plaud recordings to Claude Code",
+  "version": "1.4.0",
+  "description": "Cmd+Shift+F to forward any page — Gmail, Slack, Plaud, Zendesk, Jira, or the web — to Claude Code",
   "permissions": [
     "activeTab",
     "scripting",
     "storage"
   ],
   "host_permissions": [
-    "https://mail.google.com/*",
-    "https://app.slack.com/*",
-    "https://web.plaud.ai/*",
-    "http://localhost:5581/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
@@ -23,7 +20,7 @@
         "default": "Ctrl+Shift+F",
         "mac": "Command+Shift+F"
       },
-      "description": "Forward current thread to Claude Code"
+      "description": "Forward current page to Claude Code"
     }
   },
   "icons": {

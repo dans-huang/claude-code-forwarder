@@ -1,24 +1,29 @@
 # Claude Code Forwarder
 
-Forward Gmail threads, Slack threads, and Plaud recordings to Claude Code with one keyboard shortcut. Claude Code processes the content autonomously and headlessly — researching, drafting replies, updating dashboards — while a tiny menu bar item (`✳`) shows you what's running, what finished, and what failed. No terminal, no session babysitting.
+Forward any web page — Gmail threads, Slack threads, Plaud recordings, Zendesk tickets, Jira issues, or anything else — to Claude Code with one keyboard shortcut. Claude Code processes the content autonomously and headlessly — researching, drafting replies, updating dashboards — while a tiny menu bar item (`✳`) shows you what's running, what finished, and what failed. No terminal, no session babysitting.
+
+Everything a job produces lands somewhere you review later: a Slack draft, a Gmail draft, a published dashboard. Jobs never expect you to read their logs or answer questions mid-run.
 
 ![Demo](demo.gif)
 
 ## How It Works
 
 ```
-Gmail / Slack / Plaud (browser)
+Any page (browser)
   → Cmd+Shift+F
   → Popup: pick a template button or type an instruction → Enter
   → Local webhook receives content
   → Spawns headless Claude Code (claude -p) in tmux
+    (max 2 in parallel — the rest wait in a FIFO queue;
+     failures retry automatically up to 3 attempts)
   → Job works autonomously, then exits
-  → ✳ menu bar item shows running / done / error, with per-job
-    Terminate and View log
-  → Draft appears in Gmail / Slack, dashboard gets updated, etc.
+  → ✳ menu bar item shows running / queued / done / error, with
+    per-job Terminate / Cancel and View log
+  → The result appears as a draft in Gmail / Slack, a dashboard
+    update, etc. — open questions land at the top of the draft
 ```
 
-One shortcut to delegate. The menu bar tells you when it's done.
+One shortcut to delegate. The result comes to you as a draft.
 
 ## Requirements
 
@@ -57,7 +62,7 @@ This step is required — the shortcut won't work without it.
 3. Click the pencil icon and press **Cmd+Shift+F** (or your preferred shortcut)
 4. Change the dropdown from "In Chrome" to **Global**
 
-That's it. Open Gmail, Slack, or a Plaud recording and press **Cmd+Shift+F**.
+That's it. Open any page and press **Cmd+Shift+F**.
 
 ## Usage
 
@@ -68,7 +73,12 @@ That's it. Open Gmail, Slack, or a Plaud recording and press **Cmd+Shift+F**.
 | **Hover** a Slack message + **Cmd+Shift+F** | Grabs that thread without opening it |
 | **Hover** a Gmail inbox row + **Cmd+Shift+F** | Grabs that email without opening it |
 | **Cmd+Shift+F** on a Plaud recording (`web.plaud.ai/file/...`) | Grabs the file id + title; Claude fetches the full transcript via the Plaud MCP |
+| **Cmd+Shift+F** on a Zendesk ticket (`*.zendesk.com/agent/tickets/...`) | Grabs the ticket id + subject; Claude fetches the full ticket + conversation via the Zendesk API |
+| **Cmd+Shift+F** on a Jira issue (`*.atlassian.net/browse/...` or a board with an issue selected) | Grabs the issue key; Claude fetches the full issue via the Jira MCP |
+| **Cmd+Shift+F** on **any other page** | Grabs title + visible text; Claude re-fetches the URL itself if it needs more |
 | **Select text** + **Cmd+Shift+F** | Sends only the selected text |
+
+The hotkey always responds on http/https pages — unknown sites fall back to the generic extractor instead of doing nothing.
 
 ### The popup
 
@@ -89,10 +99,17 @@ Edit the `TEMPLATES` list at the top of `extension/background.js` to customize t
 |-------|---------|
 | `✳` | Idle — nothing running |
 | `◐ 2` | 2 jobs running — the icon spins while anything runs |
+| `◐ 2 +1` | 2 running, 1 waiting in the queue |
 | `✳ ⚠1` | Idle, 1 recent job errored |
 | `✳ ⌁` | Webhook unreachable |
 
-Click it to see each job with elapsed time, **Terminate** (kills the tmux session), and **View log** (opens the job's output in Console). Finished jobs stay listed for 6 hours or until you **Clear finished**. Jobs run fully headless — there is nothing to interact with, by design.
+Click it to see each job with elapsed time, **Terminate** (kills the tmux session), **Cancel** (drops a queued job), and **View log** (opens the job's output in Console). Finished jobs stay listed for 6 hours or until you **Clear finished**. Jobs run fully headless — there is nothing to interact with, by design.
+
+### Queue and retry
+
+At most `FORWARDER_MAX_CONCURRENT` (default 2) Claude sessions run at once; extra forwards wait in a FIFO queue and start automatically when a slot frees up. This prevents concurrent sessions from racing each other's OAuth token refresh and from hammering shared API rate limits.
+
+A job that exits non-zero is retried automatically (up to 3 attempts, 30s/60s backoff). Deliverables are always drafts, so a duplicate from a partial first run is cheap — losing the forwarded content is not.
 
 ## Recommended: MCP Integrations
 
@@ -101,8 +118,10 @@ For Claude Code to complete the full workflow, configure MCP integrations in you
 - **Slack** — read threads, create drafts
 - **Gmail** — read threads, create drafts
 - **Plaud** — [`@plaud-ai/mcp`](https://www.npmjs.com/package/@plaud-ai/mcp) for transcripts and AI summaries
+- **Jira (Atlassian)** — fetch full issues from a forwarded issue key
+- **Zendesk** — API access (or a workspace skill wrapping it) to fetch full tickets from a forwarded ticket id
 
-Without these, Claude Code can still read the forwarded DOM content, but won't be able to fetch full threads/transcripts or draft replies in place.
+Without these, Claude Code can still read the forwarded DOM content, but won't be able to fetch full threads/transcripts/tickets or draft replies in place.
 
 ## Architecture
 
@@ -115,23 +134,28 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  • gmail-content.js       │
 │  • slack-content.js       │
 │  • plaud-content.js       │
+│  • zendesk-content.js     │
+│  • jira-content.js        │
+│  • web-content.js (any)   │
 │                           │
 │  Cmd+Shift+F → extract →  │
 │  popup (templates) →      │
 │  POST /forward            │
 └───────────┬──────────────┘
             │ localhost:5581
-┌───────────▼──────────────┐      ┌─────────────────────────┐
-│   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps) │
-│                           │ poll │                          │
-│  POST /forward            │ 3s   │  • running / done / error│
-│    → build prompt         │      │  • Terminate button      │
-│    → tmux + claude -p     │      │  • View job log          │
-│  GET  /status             │      └─────────────────────────┘
+┌───────────▼──────────────┐      ┌──────────────────────────┐
+│   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps)  │
+│                           │ poll │                           │
+│  POST /forward            │ 3s   │  • running/queued/done/err│
+│    → build prompt         │      │  • Terminate / Cancel     │
+│    → queue (max 2 live)   │      │  • View job log           │
+│    → tmux + claude -p     │      └──────────────────────────┘
+│  GET  /status             │
 │  POST /terminate/<id>     │
 │  POST /clear-finished     │
 └───────────┬──────────────┘
-            │ headless tmux session (exits when done)
+            │ headless tmux session (exits when done;
+            │ auto-retry ×3 on failure)
 ┌───────────▼──────────────┐
 │   Claude Code CLI (-p)    │
 │                           │
@@ -139,6 +163,8 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  • CLAUDE.md, skills      │
 │  • MCP tools              │
 │  • Draft-first flow       │
+│  • Result → draft/board,  │
+│    never just the log     │
 │  exit code → job status   │
 └──────────────────────────┘
 ```
@@ -157,6 +183,7 @@ Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist`
 | `FORWARDER_WORKSPACE` | `~/claude` | Directory Claude Code runs in (your CLAUDE.md, skills, MCP config) |
 | `FORWARDER_MODEL` | `opus` | Model for spawned sessions |
 | `FORWARDER_EFFORT` | `high` | Effort level for spawned sessions |
+| `FORWARDER_MAX_CONCURRENT` | `2` | Parallel Claude sessions; extra forwards queue FIFO |
 
 **Keyboard shortcut:** change in `chrome://extensions/shortcuts`, keep scope **Global**.
 

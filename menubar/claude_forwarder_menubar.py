@@ -10,6 +10,7 @@ terminate button.
 Menu bar states:
   ✳        idle, nothing running
   ◐ 2      2 jobs running (icon spins while anything runs)
+  ◐ 2 +1   2 running, 1 waiting in the queue
   ◐ 2 ⚠1   2 running, 1 recent error
   ✳ ⚠1     idle, 1 recent error
   ✳ ⌁      webhook unreachable
@@ -78,6 +79,7 @@ class ForwarderMenuBar(rumps.App):
         )
         self._last_render = None
         self._running_count = 0
+        self._queued_count = 0
         self._error_count = 0
         self._offline = False
         self._spin = 0
@@ -95,6 +97,8 @@ class ForwarderMenuBar(rumps.App):
             title = f"{SPIN_FRAMES[self._spin % len(SPIN_FRAMES)]} {self._running_count}"
         else:
             title = "✳"
+        if self._queued_count:
+            title += f" +{self._queued_count}"
         if self._error_count:
             title += f" ⚠{self._error_count}"
         self.title = title
@@ -110,7 +114,7 @@ class ForwarderMenuBar(rumps.App):
         # Skip pointless menu rebuilds when nothing changed; while jobs run,
         # refresh once a minute anyway so elapsed times stay current
         fingerprint = json.dumps(status, sort_keys=True) if status else "offline"
-        if status and status.get("running"):
+        if status and (status.get("running") or status.get("queued")):
             fingerprint += f"|{int(time.time() // 60)}"
         if fingerprint == self._last_render:
             return
@@ -119,6 +123,7 @@ class ForwarderMenuBar(rumps.App):
         if status is None:
             self._offline = True
             self._running_count = 0
+            self._queued_count = 0
             self._update_title()
             self.menu.clear()
             self.menu = [
@@ -130,18 +135,20 @@ class ForwarderMenuBar(rumps.App):
             return
 
         running = status.get("running", [])
+        queued = status.get("queued", [])
         finished = status.get("finished", [])
         errors = [j for j in finished if j["status"] == "error"]
 
         self._offline = False
         self._running_count = len(running)
+        self._queued_count = len(queued)
         self._error_count = len(errors)
         self._update_title()
 
         items = []
         now = time.time()
 
-        if not running and not finished:
+        if not running and not queued and not finished:
             items.append(rumps.MenuItem("No forwarded jobs"))
 
         if running:
@@ -159,8 +166,21 @@ class ForwarderMenuBar(rumps.App):
                 ))
                 items.append(mi)
 
-        if finished:
+        if queued:
             if running:
+                items.append(None)
+            items.append(rumps.MenuItem(f"Queued ({len(queued)})"))
+            for job in queued:
+                waited = fmt_duration(now - (job.get("created_at") or now))
+                mi = rumps.MenuItem(f"⋯ {job_label(job)} — waiting {waited}")
+                mi.add(rumps.MenuItem(
+                    "Cancel",
+                    callback=self._terminate_cb(job["job_id"], job_label(job)),
+                ))
+                items.append(mi)
+
+        if finished:
+            if running or queued:
                 items.append(None)
             items.append(rumps.MenuItem("Finished"))
             for job in finished[:10]:

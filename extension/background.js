@@ -26,16 +26,25 @@ chrome.commands.onCommand.addListener(async (command) => {
   if (!tab) return;
 
   const url = tab.url || "";
-  let source = null;
+  // Extensions can't inject into chrome:// pages, the Web Store, etc.
+  if (!/^https?:/.test(url)) return;
+
+  // Dedicated extractors for known sites; everything else falls back to the
+  // generic web extractor so the hotkey always responds.
+  let source = "web";
   if (url.includes("mail.google.com")) source = "gmail";
   else if (url.includes("app.slack.com")) source = "slack";
   else if (url.includes("web.plaud.ai")) source = "plaud";
-  if (!source) return;
+  else if (/\.zendesk\.com\/agent\//.test(url)) source = "zendesk";
+  else if (/\.atlassian\.net\//.test(url)) source = "jira";
 
   const scriptFile = {
     gmail: "gmail-content.js",
     slack: "slack-content.js",
     plaud: "plaud-content.js",
+    zendesk: "zendesk-content.js",
+    jira: "jira-content.js",
+    web: "web-content.js",
   }[source];
 
   try {
@@ -58,6 +67,8 @@ chrome.commands.onCommand.addListener(async (command) => {
         thread: [{ from: "", body: selectedText, timestamp: "" }],
         subject: extracted?.subject || null,
         plaud_file_id: extracted?.plaud_file_id || undefined,
+        zendesk_ticket_id: extracted?.zendesk_ticket_id || undefined,
+        jira_issue_key: extracted?.jira_issue_key || undefined,
         hint: extracted?.hint || undefined,
         selectedOnly: true,
       };
@@ -315,6 +326,8 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
       if (extracted.thread_id) payload.thread_id = extracted.thread_id;
       if (extracted.gmail_thread_id) payload.gmail_thread_id = extracted.gmail_thread_id;
       if (extracted.plaud_file_id) payload.plaud_file_id = extracted.plaud_file_id;
+      if (extracted.zendesk_ticket_id) payload.zendesk_ticket_id = extracted.zendesk_ticket_id;
+      if (extracted.jira_issue_key) payload.jira_issue_key = extracted.jira_issue_key;
       if (extracted.hint) payload.hint = extracted.hint;
     }
 
