@@ -9,8 +9,8 @@ terminate button.
 
 Menu bar states:
   ✳        idle, nothing running
-  ✳ 2      2 jobs running
-  ✳ 2 ⚠1   2 running, 1 recent error
+  ◐ 2      2 jobs running (icon spins while anything runs)
+  ◐ 2 ⚠1   2 running, 1 recent error
   ✳ ⚠1     idle, 1 recent error
   ✳ ⌁      webhook unreachable
 
@@ -30,6 +30,8 @@ import rumps
 PORT = int(os.environ.get("PORT", 5581))
 BASE_URL = f"http://127.0.0.1:{PORT}"
 POLL_SECONDS = 3
+SPIN_FRAMES = ["◐", "◓", "◑", "◒"]
+SPIN_SECONDS = 0.4
 
 
 def fetch_status():
@@ -75,9 +77,33 @@ class ForwarderMenuBar(rumps.App):
             "ClaudeForwarder", title="✳", quit_button=None
         )
         self._last_render = None
+        self._running_count = 0
+        self._error_count = 0
+        self._offline = False
+        self._spin = 0
         self.timer = rumps.Timer(self.refresh, POLL_SECONDS)
         self.timer.start()
+        self.anim_timer = rumps.Timer(self.animate, SPIN_SECONDS)
+        self.anim_timer.start()
         self.refresh(None)
+
+    def _update_title(self):
+        if self._offline:
+            self.title = "✳ ⌁"
+            return
+        if self._running_count:
+            title = f"{SPIN_FRAMES[self._spin % len(SPIN_FRAMES)]} {self._running_count}"
+        else:
+            title = "✳"
+        if self._error_count:
+            title += f" ⚠{self._error_count}"
+        self.title = title
+
+    def animate(self, _):
+        """Spin the icon while anything is running (fast timer, title only)."""
+        if self._running_count and not self._offline:
+            self._spin += 1
+            self._update_title()
 
     def refresh(self, _):
         status = fetch_status()
@@ -91,7 +117,9 @@ class ForwarderMenuBar(rumps.App):
         self._last_render = fingerprint
 
         if status is None:
-            self.title = "✳ ⌁"
+            self._offline = True
+            self._running_count = 0
+            self._update_title()
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem("Webhook offline (localhost:%d)" % PORT),
@@ -105,12 +133,10 @@ class ForwarderMenuBar(rumps.App):
         finished = status.get("finished", [])
         errors = [j for j in finished if j["status"] == "error"]
 
-        title = "✳"
-        if running:
-            title += f" {len(running)}"
-        if errors:
-            title += f" ⚠{len(errors)}"
-        self.title = title
+        self._offline = False
+        self._running_count = len(running)
+        self._error_count = len(errors)
+        self._update_title()
 
         items = []
         now = time.time()

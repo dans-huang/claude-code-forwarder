@@ -88,8 +88,8 @@ Edit the `TEMPLATES` list at the top of `extension/background.js` to customize t
 | Title | Meaning |
 |-------|---------|
 | `✳` | Idle — nothing running |
-| `✳ 2` | 2 jobs running |
-| `✳ ⚠1` | 1 recent job errored |
+| `◐ 2` | 2 jobs running — the icon spins while anything runs |
+| `✳ ⚠1` | Idle, 1 recent job errored |
 | `✳ ⌁` | Webhook unreachable |
 
 Click it to see each job with elapsed time, **Terminate** (kills the tmux session), and **View log** (opens the job's output in Console). Finished jobs stay listed for 6 hours or until you **Clear finished**. Jobs run fully headless — there is nothing to interact with, by design.

@@ -13,10 +13,6 @@ const TEMPLATES = [
     text: "Update this task into the QA dashboard. Ensure highest clarity and reduce noise — keep only what matters, remove anything stale it supersedes.",
   },
   {
-    label: "Summarize + action items",
-    text: "Summarize this and extract action items: owner, what, by when. Flag anything that needs my decision.",
-  },
-  {
     label: "Draft email reply",
     text: "Research context as needed and draft a reply email for my later review. Draft only — never send.",
   },
