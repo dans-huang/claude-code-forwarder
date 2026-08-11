@@ -145,6 +145,8 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 
 Job artifacts live in `/tmp/claude-forwarder-jobs/` (`<session>.log`, `<session>.exit`). If the webhook restarts mid-job, it re-adopts live `fwd-*` tmux sessions on the next status poll.
 
+**Claude.ai Artifacts from headless jobs:** plain-CLI headless sessions don't get the Artifact tool, so jobs couldn't publish/update claude.ai artifact pages (e.g. a team dashboard). The launcher sets `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, which enables the tool, and publishing works headlessly (verified end-to-end). This is an unofficial toggle — if a Claude Code update changes the gating, jobs will report the missing tool in their output and this is the knob to revisit.
+
 ## Configuration
 
 Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist` (then `launchctl unload` + `load`):

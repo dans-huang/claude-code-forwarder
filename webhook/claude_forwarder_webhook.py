@@ -201,6 +201,9 @@ def launch_in_tmux(session_name, prompt, test_mode=False):
     )
     launcher_fd.write(f"""#!/bin/bash
 cd {WORKSPACE_DIR}
+# Plain-CLI headless sessions don't get the Artifact tool; the desktop
+# entrypoint does, and publishing works headlessly (verified 2026-08-11).
+export CLAUDE_CODE_ENTRYPOINT=claude-desktop
 LOG='{JOBS_DIR}/{session_name}.log'
 for ATTEMPT in 1 2 3; do
   {{
