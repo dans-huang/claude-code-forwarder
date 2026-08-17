@@ -1,5 +1,47 @@
 const WEBHOOK_URL = "http://localhost:5581/forward";
 
+const DESTINATIONS = [
+  {
+    id: "claude",
+    name: "Claude Code",
+    detail: "New interactive desktop session",
+    mark: "C",
+  },
+  {
+    id: "codex",
+    name: "Codex",
+    detail: "New interactive desktop session",
+    mark: "X",
+  },
+  {
+    id: "claude_headless",
+    name: "Background",
+    detail: "Run autonomously with Claude",
+    mark: "↗",
+  },
+];
+
+// Keep localhost access in the extension service worker. Page scripts never
+// receive direct CORS access to the Forwarder, so an arbitrary website cannot
+// start a background job or open desktop sessions on the user's behalf.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== "forward-request" || !message.payload) return false;
+
+  fetch(WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(message.payload),
+  })
+    .then(async (response) => {
+      const data = await response.json();
+      sendResponse({ transportOk: true, data });
+    })
+    .catch((error) => {
+      sendResponse({ transportOk: false, error: String(error) });
+    });
+  return true;
+});
+
 // Template prompts shown as quick-select buttons in the popup, in priority
 // order. Click one to fill the instruction box (still editable), then Enter
 // to send. Edit this list to customize.
@@ -92,11 +134,11 @@ function showPopup(tabId, source, url, extracted) {
   chrome.scripting.executeScript({
     target: { tabId },
     func: injectInstructionPopup,
-    args: [source, url, extracted, WEBHOOK_URL, TEMPLATES],
+    args: [source, url, extracted, TEMPLATES, DESTINATIONS],
   });
 }
 
-function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
+function injectInstructionPopup(source, url, extracted, templates, destinations) {
   // Remove existing popup if any
   const existing = document.getElementById("claude-forwarder-popup");
   if (existing) existing.remove();
@@ -114,6 +156,16 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
       ? `${msgCount} message${msgCount !== 1 ? "s" : ""} extracted`
       : "Will fetch via MCP (DOM extraction failed)";
 
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "'": "&#39;",
+      '"': "&quot;",
+    })[char]);
+  }
+
   shadow.innerHTML = `
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -125,19 +177,56 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
         color: #333;
       }
       .card {
-        background: white; border-radius: 12px; padding: 24px;
-        width: 420px; max-width: 90vw;
-        box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        background: #fcfbf8; border: 1px solid rgba(255,255,255,0.7);
+        border-radius: 18px; padding: 22px;
+        width: 460px; max-width: 92vw;
+        box-shadow: 0 24px 80px rgba(17,24,39,0.28);
       }
-      .header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
-      .header span { font-size: 20px; }
-      .header h3 { font-size: 16px; font-weight: 600; color: #111; }
+      .header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+      .header-mark {
+        width: 30px; height: 30px; border-radius: 9px; display: grid;
+        place-items: center; background: #171717; color: #fff;
+        font-size: 15px; font-weight: 700;
+      }
+      .header h3 { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; color: #171717; }
       .meta { font-size: 13px; color: #666; margin-bottom: 12px; }
       .meta strong { color: #333; }
       .subject {
         font-size: 13px; color: #333; margin-bottom: 12px;
         padding: 8px; background: #f5f5f5; border-radius: 6px;
       }
+      .section-label {
+        color: #73706a; font-size: 11px; font-weight: 700;
+        letter-spacing: .08em; text-transform: uppercase; margin: 14px 0 7px;
+      }
+      .destinations {
+        display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px;
+      }
+      .destination {
+        min-width: 0; padding: 10px; border: 1px solid #ddd9d1;
+        border-radius: 10px; background: rgba(255,255,255,.72); color: #292724;
+        cursor: pointer; text-align: left; font: inherit;
+        transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+      }
+      .destination:hover { border-color: #b9b3a8; transform: translateY(-1px); }
+      .destination[aria-pressed="true"] {
+        background: #171717; border-color: #171717; color: #fff;
+      }
+      .destination-top { display: flex; align-items: center; gap: 6px; }
+      .destination-mark {
+        width: 20px; height: 20px; border-radius: 6px; display: grid;
+        place-items: center; background: #eeeae3; color: #292724;
+        font-size: 10px; font-weight: 800; flex: 0 0 auto;
+      }
+      .destination[aria-pressed="true"] .destination-mark {
+        background: #fff; color: #171717;
+      }
+      .destination-name { font-size: 13px; font-weight: 700; white-space: nowrap; }
+      .destination-detail {
+        display: block; margin-top: 5px; color: #77726a;
+        font-size: 11px; line-height: 1.3;
+      }
+      .destination[aria-pressed="true"] .destination-detail { color: #cfcac1; }
       .templates {
         display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
       }
@@ -167,23 +256,31 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
         background: white; cursor: pointer; font-size: 14px; color: #333;
       }
       .btn-send {
-        padding: 8px 16px; border: none; border-radius: 6px;
-        background: #D97706; color: white; cursor: pointer;
-        font-size: 14px; font-weight: 500;
+        padding: 9px 16px; border: none; border-radius: 8px;
+        background: #171717; color: white; cursor: pointer;
+        font-size: 13px; font-weight: 650;
       }
       .btn-send:disabled { opacity: 0.6; cursor: default; }
       .status { margin-top: 12px; font-size: 13px; display: none; }
+      @media (max-width: 520px) {
+        .destinations { grid-template-columns: 1fr; }
+        .destination { padding: 9px 10px; }
+        .destination-detail { margin: 2px 0 0 26px; }
+      }
     </style>
     <div class="overlay">
       <div class="card">
         <div class="header">
-          <span>&#x1F4E8;</span>
-          <h3>Send to Claude Code</h3>
+          <span class="header-mark">F</span>
+          <h3>Forward this work</h3>
         </div>
         <div class="meta">
-          Source: <strong>${source}</strong> &middot; ${statusText}
+          Source: <strong>${escapeHtml(source)}</strong> &middot; ${escapeHtml(statusText)}
         </div>
-        ${extracted?.subject ? `<div class="subject">${extracted.subject}</div>` : ""}
+        ${extracted?.subject ? `<div class="subject">${escapeHtml(extracted.subject)}</div>` : ""}
+        <div class="section-label">Open in</div>
+        <div class="destinations" id="destinations"></div>
+        <div class="section-label">Instruction</div>
         <div class="templates" id="templates"></div>
         <textarea id="instruction" placeholder="Add instruction (e.g. draft reply, summarize, research this...)"></textarea>
         <div class="hints">
@@ -194,7 +291,7 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
         </div>
         <div class="buttons">
           <button class="btn-cancel" id="cancel">Cancel</button>
-          <button class="btn-send" id="send">Send</button>
+          <button class="btn-send" id="send">Open new Claude Code session</button>
         </div>
         <div class="status" id="status"></div>
       </div>
@@ -208,6 +305,47 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
   const sendBtn = shadow.getElementById("send");
   const statusEl = shadow.getElementById("status");
   const textarea = shadow.getElementById("instruction");
+  let selectedDestination = "claude";
+
+  const destinationRow = shadow.getElementById("destinations");
+  const destinationButtons = [];
+  (destinations || []).forEach((destination) => {
+    const btn = document.createElement("button");
+    btn.className = "destination";
+    btn.type = "button";
+    btn.dataset.destination = destination.id;
+    btn.setAttribute("aria-pressed", String(destination.id === selectedDestination));
+
+    const top = document.createElement("span");
+    top.className = "destination-top";
+    const mark = document.createElement("span");
+    mark.className = "destination-mark";
+    mark.textContent = destination.mark;
+    const name = document.createElement("span");
+    name.className = "destination-name";
+    name.textContent = destination.name;
+    top.append(mark, name);
+
+    const detail = document.createElement("span");
+    detail.className = "destination-detail";
+    detail.textContent = destination.detail;
+    btn.append(top, detail);
+    btn.addEventListener("click", () => selectDestination(destination.id));
+    destinationRow.appendChild(btn);
+    destinationButtons.push(btn);
+  });
+
+  function selectDestination(id) {
+    if (!(destinations || []).some((destination) => destination.id === id)) return;
+    selectedDestination = id;
+    destinationButtons.forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.destination === id));
+    });
+    const selected = (destinations || []).find((destination) => destination.id === id);
+    sendBtn.textContent = id === "claude_headless"
+      ? "Run in background"
+      : `Open new ${selected?.name || "desktop"} session`;
+  }
 
   // Template quick-select buttons
   const tplRow = shadow.getElementById("templates");
@@ -308,16 +446,20 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
     const instruction = textarea.value.trim();
 
     sendBtn.disabled = true;
-    sendBtn.textContent = "Sending...";
+    sendBtn.textContent = selectedDestination === "claude_headless" ? "Starting..." : "Opening...";
     statusEl.style.display = "block";
     statusEl.style.color = "#666";
-    statusEl.textContent = "Forwarding to Claude Code...";
+    const destination = (destinations || []).find((item) => item.id === selectedDestination);
+    statusEl.textContent = selectedDestination === "claude_headless"
+      ? "Starting background Claude..."
+      : `Opening a new ${destination?.name || "desktop"} session...`;
 
     const payload = {
       source,
       url,
       extraction_method: extracted ? "dom" : "url_only",
       instruction: instruction || "",
+      destination: selectedDestination,
     };
 
     if (extracted) {
@@ -332,28 +474,32 @@ function injectInstructionPopup(source, url, extracted, webhookUrl, templates) {
     }
 
     try {
-      const resp = await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+      const relay = await chrome.runtime.sendMessage({
+        type: "forward-request",
+        payload,
       });
-      const data = await resp.json();
+      if (!relay?.transportOk) {
+        throw new Error(relay?.error || "Forwarder service worker unavailable");
+      }
+      const data = relay.data;
 
       if (data.ok) {
         statusEl.style.color = "#16a34a";
-        statusEl.textContent = `Sent! Session: ${data.session_name}`;
+        statusEl.textContent = selectedDestination === "claude_headless"
+          ? `Started in background · ${data.session_name}`
+          : `${destination?.name || "Desktop"} opened · review and press Enter`;
         setTimeout(() => host.remove(), 1500);
       } else {
         statusEl.style.color = "#dc2626";
         statusEl.textContent = `Error: ${data.error}`;
         sendBtn.disabled = false;
-        sendBtn.textContent = "Send";
+        selectDestination(selectedDestination);
       }
     } catch (err) {
       statusEl.style.color = "#dc2626";
       statusEl.textContent = `Connection failed. Is the webhook running? (localhost:5581)`;
       sendBtn.disabled = false;
-      sendBtn.textContent = "Send";
+      selectDestination(selectedDestination);
     }
   });
 

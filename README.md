@@ -1,8 +1,10 @@
 # Claude Code Forwarder
 
-Forward any web page — Gmail threads, Slack threads, Plaud recordings, Zendesk tickets, Jira issues, or anything else — to Claude Code with one keyboard shortcut. Claude Code processes the content autonomously and headlessly — researching, drafting replies, updating dashboards — while a tiny menu bar item (`✳`) shows you what's running, what finished, and what failed. No terminal, no session babysitting.
+Forward any web page — Gmail threads, Slack threads, Plaud recordings, Zendesk tickets, Jira issues, or anything else — with one keyboard shortcut. Choose **Claude Code Desktop**, **Codex Desktop**, or the original **Background Claude** runner each time.
 
-Everything a job produces lands somewhere you review later: a Slack draft, a Gmail draft, a published dashboard. Jobs never expect you to read their logs or answer questions mid-run.
+Desktop mode opens the forwarded task in its own new interactive app session, ready for you to review and press Enter. Background mode processes it autonomously while a tiny menu bar item (`✳`) shows what's running, finished, or failed.
+
+Interactive handoffs stay in the new desktop session you chose. Background jobs still place their output somewhere you review later: a Slack draft, Gmail draft, or published dashboard.
 
 ![Demo](demo.gif)
 
@@ -11,24 +13,27 @@ Everything a job produces lands somewhere you review later: a Slack draft, a Gma
 ```
 Any page (browser)
   → Cmd+Shift+F
-  → Popup: pick a template button or type an instruction → Enter
+  → Popup: choose Claude Code / Codex / Background
+  → Pick a template button or type an instruction → Enter
   → Local webhook receives content
-  → Spawns headless Claude Code (claude -p) in tmux
-    (max 2 in parallel — the rest wait in a FIFO queue;
-     failures retry automatically up to 3 attempts)
-  → Job works autonomously, then exits
+  ├→ Desktop: writes a private work packet → opens a new native app session
+  │  (the prompt is prefilled, not auto-submitted; you review and press Enter)
+  └→ Background: spawns headless Claude Code (claude -p) in tmux
+     (max 2 in parallel; failures retry automatically up to 3 attempts)
   → ✳ menu bar item shows running / queued / done / error, with
     per-job Terminate / Cancel and View log
   → The result appears as a draft in Gmail / Slack, a dashboard
     update, etc. — open questions land at the top of the draft
 ```
 
-One shortcut to delegate. The result comes to you as a draft.
+One shortcut, with either an interactive handoff or autonomous delegation.
 
 ## Requirements
 
 - **macOS** (launchd + menu bar app are macOS only)
-- **Claude Code CLI** — [install guide](https://docs.anthropic.com/en/docs/claude-code)
+- **Claude Desktop** for interactive Claude Code handoff
+- **ChatGPT/Codex Desktop** for interactive Codex handoff
+- **Claude Code CLI** for the optional Background mode — [install guide](https://docs.anthropic.com/en/docs/claude-code)
 - **Chrome, Arc, or Chromium-based browser**
 - **Slack in browser** (app.slack.com) — the standalone Slack desktop app won't work since Chrome extensions can't inject into it.
 
@@ -82,7 +87,15 @@ The hotkey always responds on http/https pages — unknown sites fall back to th
 
 ### The popup
 
-Template buttons sit above the instruction box — click one (or press its number key) to fill the instruction, edit it if you want, then Enter to send. Or ignore them and type your own.
+Choose the destination at the top of the popup. Template buttons sit above the instruction box — click one (or press its number key) to fill the instruction, edit it if you want, then Enter. Or ignore them and type your own.
+
+| Destination | Result |
+|-------------|--------|
+| **Claude Code** | Opens a new Claude Code Desktop session with the task prefilled |
+| **Codex** | Opens a new Codex Desktop local session with the task prefilled |
+| **Background** | Runs the existing autonomous `claude -p` job and reports through `✳` |
+
+Desktop links deliberately do not auto-submit. This leaves one visible approval point: review the short packet instruction and press Enter. Full forwarded content is stored in a private local Markdown packet (`0600`) instead of being squeezed into the URL. Packets expire after 30 days by default.
 
 | Key | Action |
 |-----|--------|
@@ -139,7 +152,7 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  • web-content.js (any)   │
 │                           │
 │  Cmd+Shift+F → extract →  │
-│  popup (templates) →      │
+│  popup (target+template) →│
 │  POST /forward            │
 └───────────┬──────────────┘
             │ localhost:5581
@@ -147,9 +160,9 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps)  │
 │                           │ poll │                           │
 │  POST /forward            │ 3s   │  • running/queued/done/err│
-│    → build prompt         │      │  • Terminate / Cancel     │
-│    → queue (max 2 live)   │      │  • View job log           │
-│    → tmux + claude -p     │      └──────────────────────────┘
+│    → private work packet  │      │  • Terminate / Cancel     │
+│      + native deep link   │      │  • View job log           │
+│    OR queue + claude -p   │      └──────────────────────────┘
 │  GET  /status             │
 │  POST /terminate/<id>     │
 │  POST /clear-finished     │
@@ -184,6 +197,8 @@ Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist`
 | `FORWARDER_MODEL` | `opus` | Model for spawned sessions |
 | `FORWARDER_EFFORT` | `high` | Effort level for spawned sessions |
 | `FORWARDER_MAX_CONCURRENT` | `2` | Parallel Claude sessions; extra forwards queue FIFO |
+| `FORWARDER_PACKETS_DIR` | `~/Library/Application Support/Claude Code Forwarder/Inbox` | Private interactive handoff packets |
+| `FORWARDER_PACKET_TTL_DAYS` | `30` | Remove old packet files after this many days; `0` disables pruning |
 
 **Keyboard shortcut:** change in `chrome://extensions/shortcuts`, keep scope **Global**.
 
@@ -202,6 +217,13 @@ tail -f /tmp/claude-forwarder-menubar.log
 # Smoke test (5-second fake job, no Claude involved)
 curl -s -X POST http://localhost:5581/forward \
   -H "Content-Type: application/json" -d '{"_test": true}'
+```
+
+**Development tests:**
+```bash
+.venv/bin/python3 -m unittest discover -s tests -v
+node tests/test_extension_service_worker.js
+node --check extension/background.js
 ```
 
 ## Uninstall

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Claude Code Forwarder",
-  "version": "1.4.0",
-  "description": "Cmd+Shift+F to forward any page — Gmail, Slack, Plaud, Zendesk, Jira, or the web — to Claude Code",
+  "version": "1.5.0",
+  "description": "Forward any page into a new Claude Code or Codex desktop session, or run it in the background",
   "permissions": [
     "activeTab",
     "scripting",
@@ -20,7 +20,7 @@
         "default": "Ctrl+Shift+F",
         "mac": "Command+Shift+F"
       },
-      "description": "Forward current page to Claude Code"
+      "description": "Forward current page to Claude Code or Codex"
     }
   },
   "icons": {
