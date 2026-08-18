@@ -1,50 +1,52 @@
 # Claude Code Forwarder
 
-Forward any web page — Gmail threads, Slack threads, Plaud recordings, Zendesk tickets, Jira issues, or anything else — with one keyboard shortcut. Choose **Claude Code Desktop**, **Codex Desktop**, or the original **Background Claude** runner each time.
+Send the page you are looking at to a coding agent, with one keyboard shortcut.
 
-Desktop mode opens the forwarded task in its own new interactive app session, ready for you to review and press Enter. Background mode processes it autonomously while a tiny menu bar item (`✳`) shows what's running, finished, or failed.
+Press **Cmd+Shift+F** on a Gmail thread, Slack thread, Zendesk ticket, Jira issue, Plaud recording, or any other web page. Pick where it goes, pick which project it lands in, add an instruction, press Enter.
 
-Interactive handoffs stay in the new desktop session you chose. Background jobs still place their output somewhere you review later: a Slack draft, Gmail draft, or published dashboard.
+| Destination | What happens |
+|-------------|--------------|
+| **Claude Code** | Opens a new Claude Code Desktop session, task prefilled |
+| **Codex** | Opens a new Codex Desktop session, task prefilled |
+| **Background** | Runs a headless `claude -p` job and reports through the `✳` menu bar item |
+
+Desktop sessions open **inside a project directory you choose**, so the agent starts with that repository's `CLAUDE.md` / `AGENTS.md`, Git state, skills, and local context already loaded. The prompt is prefilled but never auto-submitted — you read it and press Enter.
 
 ![Demo](demo.gif)
 
-## How It Works
+## How it works
 
 ```
 Any page (browser)
   → Cmd+Shift+F
-  → Popup: choose Claude Code / Codex / Background
-  → Desktop modes: Project selector (Auto · <resolved project> by default)
-  → Pick a template button or type an instruction → Enter
-  → Local webhook receives content
-  ├→ Desktop: writes a private work packet → opens a new native app session
-  │  inside the selected project (AGENTS.md/CLAUDE.md, Git state, skills,
-  │  and local context all come from that repo)
-  │  (the prompt is prefilled, not auto-submitted; you review and press Enter)
-  └→ Background: spawns headless Claude Code (claude -p) in tmux
-     (max 2 in parallel; failures retry automatically up to 3 attempts)
-  → ✳ menu bar item shows running / queued / done / error, with
-    per-job Terminate / Cancel and View log
-  → The result appears as a draft in Gmail / Slack, a dashboard
-    update, etc. — open questions land at the top of the draft
+  → Popup: destination + project + instruction → Enter
+  → Local webhook (localhost:5581) receives the content
+  │
+  ├→ Desktop: validates the project, writes a private work packet,
+  │  opens a new native session in that project
+  │  (prefilled, not submitted — you review and press Enter)
+  │
+  └→ Background: queues a headless claude -p job in tmux
+     (max 2 in parallel, auto-retry ×3 on failure)
+     → result lands as a Gmail draft, Slack draft, or dashboard update
 ```
 
-One shortcut, with either an interactive handoff or autonomous delegation.
+Nothing leaves your machine except what the agent itself does. The webhook binds to `127.0.0.1` and serves no CORS headers, so no web page can reach it.
 
 ## Requirements
 
-- **macOS** (launchd + menu bar app are macOS only)
-- **Claude Desktop** for interactive Claude Code handoff
-- **ChatGPT/Codex Desktop** for interactive Codex handoff
-- **Claude Code CLI** for the optional Background mode — [install guide](https://docs.anthropic.com/en/docs/claude-code)
-- **Chrome, Arc, or Chromium-based browser**
-- **Slack in browser** (app.slack.com) — the standalone Slack desktop app won't work since Chrome extensions can't inject into it.
+- **macOS** — launchd services and the menu bar app are macOS only
+- **Chrome, Arc, Brave, Edge, or another Chromium browser**
+- **Claude Desktop** for the Claude Code destination
+- **ChatGPT/Codex Desktop** for the Codex destination
+- **Claude Code CLI** for Background mode — [install guide](https://docs.anthropic.com/en/docs/claude-code)
+- **Slack in the browser** (`app.slack.com`) — extensions cannot inject into the standalone Slack app
 
-The setup script installs everything else automatically (tmux, a private Python venv with Flask + rumps, both background services).
+`setup.sh` installs the rest: tmux, a private Python venv with Flask and rumps, and both login services.
 
-## Setup
+## Install
 
-### Step 1: Run the installer
+### 1. Run the installer
 
 ```bash
 git clone https://github.com/dans-huang/claude-code-forwarder.git
@@ -52,108 +54,155 @@ cd claude-code-forwarder
 ./setup.sh
 ```
 
-This installs tmux, creates a Python venv with the dependencies, starts the **webhook** and the **✳ menu bar app** as login services, and runs a smoke test (you'll see `✳ 1` appear in the menu bar for a few seconds, then flip back to `✳`).
+This starts the webhook and the `✳` menu bar app as login services, then runs a smoke test. You should see `✳ 1` in the menu bar for a few seconds, then `✳`.
 
-### Step 2: Load the Chrome extension
+### 2. Load the extension
 
-1. Go to `chrome://extensions`
-2. Enable **Developer mode** (top-right toggle)
+1. Open `chrome://extensions`
+2. Turn on **Developer mode** (top right)
 3. Click **Load unpacked**
 4. Select the `extension/` folder from this repo
 
-### Step 3: Set the keyboard shortcut to Global
+### 3. Make the shortcut Global
 
-This step is required — the shortcut won't work without it.
+Required. The shortcut does not work without it.
 
-1. Go to `chrome://extensions/shortcuts`
+1. Open `chrome://extensions/shortcuts`
 2. Find **Claude Code Forwarder**
-3. Click the pencil icon and press **Cmd+Shift+F** (or your preferred shortcut)
+3. Click the pencil icon, press **Cmd+Shift+F**
 4. Change the dropdown from "In Chrome" to **Global**
 
-That's it. Open any page and press **Cmd+Shift+F**.
+Done. Open any page and press **Cmd+Shift+F**.
 
-## Usage
+## Using it
 
-| Action | What happens |
-|--------|-------------|
-| **Cmd+Shift+F** in an email thread | Extracts full email thread |
-| **Cmd+Shift+F** in a Slack thread | Extracts thread + thread ID; Claude always re-fetches the complete thread via MCP |
-| **Hover** a Slack message + **Cmd+Shift+F** | Grabs that thread without opening it |
-| **Hover** a Gmail inbox row + **Cmd+Shift+F** | Grabs that email without opening it |
-| **Cmd+Shift+F** on a Plaud recording (`web.plaud.ai/file/...`) | Grabs the file id + title; Claude fetches the full transcript via the Plaud MCP |
-| **Cmd+Shift+F** on a Zendesk ticket (`*.zendesk.com/agent/tickets/...`) | Grabs the ticket id + subject; Claude fetches the full ticket + conversation via the Zendesk API |
-| **Cmd+Shift+F** on a Jira issue (`*.atlassian.net/browse/...` or a board with an issue selected) | Grabs the issue key; Claude fetches the full issue via the Jira MCP |
-| **Cmd+Shift+F** on **any other page** | Grabs title + visible text; Claude re-fetches the URL itself if it needs more |
-| **Select text** + **Cmd+Shift+F** | Sends only the selected text |
+### What gets extracted
 
-The hotkey always responds on http/https pages — unknown sites fall back to the generic extractor instead of doing nothing.
+| Where you press Cmd+Shift+F | What it sends |
+|-----------------------------|---------------|
+| A Gmail thread | The full email thread |
+| A Slack thread | Thread text + thread ID; the agent re-fetches the complete thread via MCP |
+| Hovering a Slack message | That thread, without opening it |
+| Hovering a Gmail inbox row | That email, without opening it |
+| A Plaud recording (`web.plaud.ai/file/...`) | File ID + title; the agent fetches the transcript via the Plaud MCP |
+| A Zendesk ticket (`*.zendesk.com/agent/tickets/...`) | Ticket ID + subject; the agent fetches the full ticket via the Zendesk API |
+| A Jira issue (`*.atlassian.net/browse/...`) | Issue key; the agent fetches the full issue via the Jira MCP |
+| Any other page | Title + visible text; the agent re-fetches the URL if it needs more |
+| Any page with text selected | Only the selected text |
 
-### The popup
+The hotkey always responds on http/https pages. Unknown sites fall back to the generic extractor instead of doing nothing.
 
-Choose the destination at the top of the popup. Template buttons sit above the instruction box — click one (or press its number key) to fill the instruction, edit it if you want, then Enter. Or ignore them and type your own.
+### The project selector
 
-| Destination | Result |
-|-------------|--------|
-| **Claude Code** | Opens a new Claude Code Desktop session with the task prefilled |
-| **Codex** | Opens a new Codex Desktop local session with the task prefilled |
-| **Background** | Runs the existing autonomous `claude -p` job and reports through `✳` |
+For Claude Code and Codex, a **Project** dropdown sits under the destination row. Whatever you pick is the directory the new session opens in. Claude Code and Codex share one list — this is task context, not app configuration.
 
-### The Project selector
+| Option | Meaning |
+|--------|---------|
+| **Auto · \<project\>** | The default. No clicking needed. |
+| **General workspace** | `FORWARDER_WORKSPACE`, the classic behavior |
+| **Recent** | Projects you explicitly picked recently |
+| **Projects** | Auto-discovered project directories |
+| **Choose folder…** | Paste a path; the webhook validates it before accepting |
 
-For Claude Code and Codex, a compact **Project** dropdown sits under the destination row. The session opens *inside* that repository, so the agent immediately inherits its `AGENTS.md` / `CLAUDE.md`, Git state, skills, and local context. Claude Code and Codex share one project list — it's task context, not app configuration.
+**How Auto decides.** If you have explicitly picked a project for this site before, Auto resolves to that project — forward a Jira issue once into `repo-a` and every later Jira forward defaults there. With no memory for the site, Auto resolves to the General workspace. It never guesses from page content. The exact folder that will open is always printed under the dropdown.
 
-- **Auto · \<project\>** (default) — no clicking needed. Auto resolves to the project you last explicitly picked for this site (e.g. always open Jira forwards in `repo-a`); with no site memory it resolves to the **General workspace**. The exact folder that will open is always shown under the dropdown.
-- **General workspace** — the classic `FORWARDER_WORKSPACE` behavior.
-- **Recent** — your last few explicitly used projects.
-- **Projects** — auto-discovered: directories up to two levels under the configured roots that look like projects (`.git`, `CLAUDE.md`, `AGENTS.md`, `package.json`, …). No home-directory-wide scanning, hidden/vendor/`_archive` dirs are skipped.
-- **Choose folder…** — paste any path; the webhook validates it server-side before it's accepted.
+**How memory works.** Explicitly picking a project and forwarding remembers it for that domain. Forwarding on Auto never changes the memory. To stop remembering a site, select Auto and click **Forget for this site**; explicitly forwarding with **General workspace** clears it too. Memory lives in `chrome.storage.local` and is only ever a hint — the webhook re-validates every path.
 
-Picking a project explicitly and forwarding remembers it for that site (per-domain). Auto forwards never change the memory. To stop remembering, select Auto and click **Forget for this site**. Explicitly forwarding a site with **General workspace** also clears its memory.
+**How discovery works.** The webhook scans up to two levels under `FORWARDER_PROJECT_ROOTS` and lists directories carrying a project marker (`.git`, `CLAUDE.md`, `AGENTS.md`, `.claude`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`). It never walks your whole home directory. Hidden dirs, `_`-prefixed dirs, `node_modules`, `venv`, `dist`, `build`, `tmp`, and `archive` are skipped, and symlinked directories are not followed.
 
-Every workspace is re-validated server-side on each forward: real paths only, the directory must exist, and it must sit inside `FORWARDER_PROJECT_ROOTS` (or be listed in `FORWARDER_EXTRA_PROJECTS`). Traversal (`..`) and symlink escapes are resolved and rejected. If the webhook is unreachable, the popup pins the selector to the General workspace and forwards exactly like pre-1.6.
+Background mode hides the selector. Headless jobs always run in the General workspace, where the draft-first skills live.
 
-Background mode hides the selector — headless jobs always run in the general workspace, where the draft-first skills live.
+### Instruction and keyboard
 
-Desktop links deliberately do not auto-submit. This leaves one visible approval point: review the short packet instruction and press Enter. Full forwarded content is stored in a private local Markdown packet (`0600`) instead of being squeezed into the URL. Packets expire after 30 days by default.
+Template buttons sit above the instruction box. Click one, or press its number key, to fill the box — then edit it or send as is.
 
 | Key | Action |
 |-----|--------|
 | **1–9** | Pick a template (while the box is empty or holds an unedited template) |
-| **Enter** | Send to Claude Code |
+| **Enter** | Send to the selected destination |
 | **Shift+Enter** | New line |
 | **Esc** | Cancel |
 
-Edit the `TEMPLATES` list at the top of `extension/background.js` to customize the buttons (then reload the extension).
+Edit the `TEMPLATES` list at the top of `extension/background.js` to change the buttons, then reload the extension.
 
 ### The ✳ menu bar item
 
 | Title | Meaning |
 |-------|---------|
-| `✳` | Idle — nothing running |
-| `◐ 2` | 2 jobs running — the icon spins while anything runs |
-| `◐ 2 +1` | 2 running, 1 waiting in the queue |
+| `✳` | Idle |
+| `◐ 2` | 2 jobs running; the icon spins while anything runs |
+| `◐ 2 +1` | 2 running, 1 queued |
 | `✳ ⚠1` | Idle, 1 recent job errored |
 | `✳ ⌁` | Webhook unreachable |
 
-Click it to see each job with elapsed time, **Terminate** (kills the tmux session), **Cancel** (drops a queued job), and **View log** (opens the job's output in Console). Finished jobs stay listed for 6 hours or until you **Clear finished**. Jobs run fully headless — there is nothing to interact with, by design.
+Click it for each job with elapsed time, **Terminate** (kills the tmux session), **Cancel** (drops a queued job), and **View log**. Finished jobs stay listed for 6 hours or until you **Clear finished**. Background jobs are fully headless by design — there is nothing to interact with mid-run.
 
-### Queue and retry
+At most `FORWARDER_MAX_CONCURRENT` (default 2) jobs run at once; the rest wait in a FIFO queue. This keeps concurrent sessions from racing each other's OAuth token refresh and from exhausting shared API rate limits. A job that exits non-zero retries up to 3 times (30s, then 60s backoff). Deliverables are always drafts, so a duplicate from a partial run is cheap; losing the forwarded content is not.
 
-At most `FORWARDER_MAX_CONCURRENT` (default 2) Claude sessions run at once; extra forwards wait in a FIFO queue and start automatically when a slot frees up. This prevents concurrent sessions from racing each other's OAuth token refresh and from hammering shared API rate limits.
+## Security model
 
-A job that exits non-zero is retried automatically (up to 3 attempts, 30s/60s backoff). Deliverables are always drafts, so a duplicate from a partial first run is cheap — losing the forwarded content is not.
+The forwarder opens native sessions and reads local directories on your behalf, so the trust boundary matters.
 
-## Recommended: MCP Integrations
+**The browser never picks a path.** The extension sends a workspace path, but the webhook treats it as a request, not an instruction. Every path is expanded, fully resolved with `realpath` (symlinks and `..` included), and then checked against the allowlist: the General workspace, anything inside `FORWARDER_PROJECT_ROOTS`, or an exact entry in `FORWARDER_EXTRA_PROJECTS`. Traversal attempts and symlinks pointing outside a root are rejected against their real target. A rejected workspace fails with a 400 before any packet is written or any app is opened.
 
-For Claude Code to complete the full workflow, configure MCP integrations in your Claude Code workspace:
+**No web page can reach the webhook.** It binds to `127.0.0.1` and never emits CORS headers. Only the extension service worker talks to it. Page scripts cannot start a job or open a session.
+
+**Forwarded content is private and stays local.** The full thread goes into a Markdown work packet at `0600` inside a `0700` directory, not into the URL. The deep link carries only a short pointer to that packet, which also avoids URL length limits on long threads. Packets are deleted after `FORWARDER_PACKET_TTL_DAYS` (default 30).
+
+**Nothing is submitted for you.** Desktop links prefill the prompt and stop. That leaves exactly one visible approval point before an agent starts acting.
+
+**Forwarded content is data, not instructions.** The packet tells the agent to treat quoted page, email, thread, and transcript content as untrusted, and that only your explicit instruction is the task.
+
+## Configuration
+
+Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist`, then reload the service.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PORT` | `5581` | Webhook port; the menu bar app reads the same var |
+| `FORWARDER_WORKSPACE` | `~/claude` | General workspace: background jobs and the default desktop target |
+| `FORWARDER_PROJECT_ROOTS` | `FORWARDER_WORKSPACE` | Colon-separated roots the project selector may open, scanned two levels deep |
+| `FORWARDER_EXTRA_PROJECTS` | *(none)* | Colon-separated project dirs allowed outside the roots; exact match, subdirectories not included |
+| `FORWARDER_MODEL` | `opus` | Model for background sessions |
+| `FORWARDER_EFFORT` | `high` | Effort level for background sessions |
+| `FORWARDER_MAX_CONCURRENT` | `2` | Parallel background jobs; the rest queue FIFO |
+| `FORWARDER_PACKETS_DIR` | `~/Library/Application Support/Claude Code Forwarder/Inbox` | Private work packets |
+| `FORWARDER_PACKET_TTL_DAYS` | `30` | Delete packets older than this; `0` disables pruning |
+
+If all your repos live under `~/claude`, you do not need to set anything. Point `FORWARDER_PROJECT_ROOTS` at your code directories if they live elsewhere, for example `~/code:~/work`.
+
+**Upgrading from 1.5 or earlier.** No config change required. Restart the webhook service and reload the extension to get the project selector. Payloads without a `workspace` — old clients included — keep opening in `FORWARDER_WORKSPACE` exactly as before.
+
+**Services:**
+```bash
+launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
+launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
+launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
+launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
+```
+
+**Logs:**
+```bash
+tail -f /tmp/claude-forwarder-webhook.log
+tail -f /tmp/claude-forwarder-menubar.log
+```
+
+**Smoke test** (5-second fake job, no Claude involved):
+```bash
+curl -s -X POST http://localhost:5581/forward -H "Content-Type: application/json" -d '{"_test": true}'
+```
+
+## Recommended MCP integrations
+
+Configure these in your Claude Code workspace so the agent can finish the whole workflow:
 
 - **Slack** — read threads, create drafts
 - **Gmail** — read threads, create drafts
 - **Plaud** — [`@plaud-ai/mcp`](https://www.npmjs.com/package/@plaud-ai/mcp) for transcripts and AI summaries
 - **Jira (Atlassian)** — fetch full issues from a forwarded issue key
-- **Zendesk** — API access (or a workspace skill wrapping it) to fetch full tickets from a forwarded ticket id
+- **Zendesk** — API access, or a workspace skill wrapping it, to fetch full tickets
 
-Without these, Claude Code can still read the forwarded DOM content, but won't be able to fetch full threads/transcripts/tickets or draft replies in place.
+Without these the agent still reads the forwarded DOM content, but cannot fetch complete threads, transcripts, or tickets, and cannot draft replies in place.
 
 ## Architecture
 
@@ -171,10 +220,11 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  • web-content.js (any)   │
 │                           │
 │  Cmd+Shift+F → extract →  │
-│  popup (target+project+   │
-│  template) → POST /forward│
+│  popup (destination +     │
+│  project + instruction) → │
+│  service worker → POST    │
 └───────────┬──────────────┘
-            │ localhost:5581
+            │ localhost:5581 (no CORS; extension only)
 ┌───────────▼──────────────┐      ┌──────────────────────────┐
 │   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps)  │
 │                           │ poll │                           │
@@ -188,70 +238,63 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  GET  /status             │
 │  POST /terminate/<id>     │
 │  POST /clear-finished     │
-└───────────┬──────────────┘
-            │ headless tmux session (exits when done;
-            │ auto-retry ×3 on failure)
-┌───────────▼──────────────┐
-│   Claude Code CLI (-p)    │
-│                           │
-│  Full workspace:          │
-│  • CLAUDE.md, skills      │
-│  • MCP tools              │
-│  • Draft-first flow       │
-│  • Result → draft/board,  │
-│    never just the log     │
-│  exit code → job status   │
-└──────────────────────────┘
+└─────┬──────────────┬─────┘
+      │              │ headless tmux session
+      │              │ (auto-retry ×3)
+      ▼              ▼
+┌─────────────┐  ┌──────────────────────────┐
+│  Codex /    │  │   Claude Code CLI (-p)    │
+│  Claude     │  │                           │
+│  Desktop    │  │  • CLAUDE.md, skills      │
+│             │  │  • MCP tools              │
+│  New session│  │  • Draft-first flow       │
+│  in the     │  │  • Result → draft/board,  │
+│  chosen     │  │    never just the log     │
+│  project    │  │  exit code → job status   │
+└─────────────┘  └──────────────────────────┘
 ```
 
 Job artifacts live in `/tmp/claude-forwarder-jobs/` (`<session>.log`, `<session>.exit`). If the webhook restarts mid-job, it re-adopts live `fwd-*` tmux sessions on the next status poll.
 
-**Claude.ai Artifacts from headless jobs:** plain-CLI headless sessions don't get the Artifact tool, so jobs couldn't publish/update claude.ai artifact pages (e.g. a team dashboard). The launcher sets `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, which enables the tool, and publishing works headlessly (verified end-to-end). This is an unofficial toggle — if a Claude Code update changes the gating, jobs will report the missing tool in their output and this is the knob to revisit.
+**Claude.ai Artifacts from headless jobs:** plain-CLI headless sessions do not get the Artifact tool, so jobs could not publish or update claude.ai artifact pages such as a team dashboard. The launcher sets `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, which enables the tool, and publishing works headlessly (verified end to end). This is an unofficial toggle. If a Claude Code update changes the gating, jobs will report the missing tool in their output, and this is the knob to revisit.
 
-## Configuration
+## Development
 
-Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist` (then `launchctl unload` + `load`):
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `PORT` | `5581` | Webhook port (menu bar app reads the same var) |
-| `FORWARDER_WORKSPACE` | `~/claude` | General workspace: background jobs and the default desktop target (your CLAUDE.md, skills, MCP config) |
-| `FORWARDER_PROJECT_ROOTS` | `FORWARDER_WORKSPACE` | Colon-separated roots the project selector may open; scanned two levels deep for project directories |
-| `FORWARDER_EXTRA_PROJECTS` | *(none)* | Colon-separated individual project dirs allowed *outside* the roots (exact match, no subdirectories) |
-| `FORWARDER_MODEL` | `opus` | Model for spawned sessions |
-| `FORWARDER_EFFORT` | `high` | Effort level for spawned sessions |
-| `FORWARDER_MAX_CONCURRENT` | `2` | Parallel Claude sessions; extra forwards queue FIFO |
-| `FORWARDER_PACKETS_DIR` | `~/Library/Application Support/Claude Code Forwarder/Inbox` | Private interactive handoff packets |
-| `FORWARDER_PACKET_TTL_DAYS` | `30` | Remove old packet files after this many days; `0` disables pruning |
-
-**Upgrading from ≤ 1.5:** no config change required. Restart the webhook service (unload + load below) and reload the extension in `chrome://extensions` to get the project selector. Old clients and payloads without a `workspace` keep opening in `FORWARDER_WORKSPACE` exactly as before. Set `FORWARDER_PROJECT_ROOTS` only if your repos live outside `~/claude`.
-
-**Keyboard shortcut:** change in `chrome://extensions/shortcuts`, keep scope **Global**.
-
-**Services:**
 ```bash
-# Stop / start
-launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
-launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
-launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
-launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
-
-# Logs
-tail -f /tmp/claude-forwarder-webhook.log
-tail -f /tmp/claude-forwarder-menubar.log
-
-# Smoke test (5-second fake job, no Claude involved)
-curl -s -X POST http://localhost:5581/forward \
-  -H "Content-Type: application/json" -d '{"_test": true}'
-```
-
-**Development tests:**
-```bash
-.venv/bin/python3 -m unittest discover -s tests -v
-node tests/test_extension_service_worker.js
-node tests/test_extension_projects.js
+.venv/bin/python3 -m unittest discover -s tests -v   # webhook: forwarding, projects, validation
+node tests/test_extension_service_worker.js          # service worker relay
+node tests/test_extension_projects.js                # project list, memory, payload, fallback
 node --check extension/background.js
 ```
+
+## Troubleshooting
+
+**Shortcut does nothing**
+Set the shortcut to **Global** in `chrome://extensions/shortcuts`. "In Chrome" / "In Arc" scope is unreliable.
+
+**Popup says "Connection failed"**
+The webhook is not running. Check `curl http://localhost:5581/status` and restart the service.
+
+**`✳` shows `⌁`**
+Same cause — the menu bar app cannot reach the webhook. Check the webhook log.
+
+**Project dropdown says "Project list unavailable"**
+The webhook is unreachable. Forwards still work and open in the General workspace.
+
+**A project is missing from the dropdown**
+It is outside `FORWARDER_PROJECT_ROOTS`, deeper than two levels, has no project marker, or sits in a skipped directory (hidden, `_`-prefixed, `node_modules`, `archive`, …). Use **Choose folder…**, or add its root to `FORWARDER_PROJECT_ROOTS`.
+
+**"workspace is outside the allowed project roots"**
+Working as intended. Add the directory's root to `FORWARDER_PROJECT_ROOTS`, or the directory itself to `FORWARDER_EXTRA_PROJECTS`, then restart the webhook.
+
+**A background job shows error**
+Click the job → **View log** for the Claude Code output, including the failure.
+
+**Slack popup: cannot type in the text field**
+Reload the extension in `chrome://extensions`. The keyboard trap needs a fresh injection.
+
+**Gmail/Slack/Plaud extraction returns 0 messages**
+DOM selectors may be outdated. The extension falls back to URL-only mode; for Slack and Plaud the agent re-fetches full content via MCP anyway. Open an issue if it happens consistently.
 
 ## Uninstall
 
@@ -260,30 +303,14 @@ launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
 launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
 rm ~/Library/LaunchAgents/com.claude-code-forwarder.{webhook,menubar}.plist
 
-rm -rf ~/claude-code-forwarder  # or wherever you cloned it
-
-# Remove the Chrome extension manually in chrome://extensions
+rm -rf ~/claude-code-forwarder   # or wherever you cloned it
 ```
 
-## Troubleshooting
+Then remove the extension in `chrome://extensions`. Work packets, if you want them gone too:
 
-**Shortcut doesn't work**
-Make sure the shortcut is set to **Global** in `chrome://extensions/shortcuts`. "In Chrome" / "In Arc" scope may not work reliably.
-
-**Popup says "Connection failed"**
-The webhook isn't running. Check `curl http://localhost:5581/status` or restart the service.
-
-**✳ shows ⌁**
-Same thing — the menu bar app can't reach the webhook. Check the webhook log.
-
-**A job shows error**
-Click the job → **View log** to see the Claude Code output, including the failure.
-
-**Slack popup: can't type in the text field**
-Reload the extension in `chrome://extensions`. The keyboard trap may need a fresh injection.
-
-**Gmail/Slack/Plaud extraction returns 0 messages**
-DOM selectors may be outdated. The extension falls back to URL-only mode; for Slack and Plaud, Claude Code re-fetches full content via MCP anyway. Open an issue if this happens consistently.
+```bash
+rm -rf ~/Library/Application\ Support/Claude\ Code\ Forwarder
+```
 
 ## License
 
