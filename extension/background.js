@@ -1,4 +1,6 @@
 const WEBHOOK_URL = "http://localhost:5581/forward";
+const PROJECTS_URL = "http://localhost:5581/projects";
+const VALIDATE_URL = "http://localhost:5581/projects/validate";
 
 const DESTINATIONS = [
   {
@@ -21,25 +23,193 @@ const DESTINATIONS = [
   },
 ];
 
+const MAX_RECENT_PROJECTS = 6;
+const MAX_RECENTS_SHOWN = 4;
+
+// ── Project memory ───────────────────────────────────────────────
+// One chrome.storage.local key remembers project choices:
+//   { last, recents: [path], byDomain: { hostname: path } }
+// The stored paths are hints for the popup only — the webhook re-validates
+// every workspace server-side before opening anything.
+
+function normalizeProjectMemory(raw) {
+  const memory = raw && typeof raw === "object" ? raw : {};
+  return {
+    last: typeof memory.last === "string" ? memory.last : null,
+    recents: Array.isArray(memory.recents)
+      ? memory.recents
+          .filter((path) => typeof path === "string" && path)
+          .slice(0, MAX_RECENT_PROJECTS)
+      : [],
+    byDomain:
+      memory.byDomain && typeof memory.byDomain === "object"
+        ? { ...memory.byDomain }
+        : {},
+  };
+}
+
+async function getProjectMemory() {
+  const stored = await chrome.storage.local.get("projectMemory");
+  return normalizeProjectMemory(stored?.projectMemory);
+}
+
+async function saveProjectMemory(memory) {
+  await chrome.storage.local.set({ projectMemory: memory });
+}
+
+// Pure: fold one successful forward into the remembered state.
+// Explicit choices update the per-site mapping; picking the general
+// workspace explicitly clears the mapping (back to the default).
+function applyProjectSelection(rawMemory, selection) {
+  const memory = normalizeProjectMemory(rawMemory);
+  const { path, domain, explicit, generalPath } = selection || {};
+  if (typeof path !== "string" || !path) return memory;
+  memory.last = path;
+  if (path !== generalPath) {
+    memory.recents = [
+      path,
+      ...memory.recents.filter((recent) => recent !== path),
+    ].slice(0, MAX_RECENT_PROJECTS);
+  }
+  if (explicit && domain) {
+    if (path === generalPath) delete memory.byDomain[domain];
+    else memory.byDomain[domain] = path;
+  }
+  return memory;
+}
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function findProjectIn(list, path) {
+  if (!list || !path) return null;
+  if (list.general?.path === path) {
+    return { path, name: list.general.name };
+  }
+  const hit = (list.projects || []).find((project) => project.path === path);
+  return hit ? { path: hit.path, name: hit.name } : null;
+}
+
+async function fetchProjectList() {
+  const response = await fetch(PROJECTS_URL);
+  const data = await response.json();
+  if (!data?.ok) throw new Error(data?.error || "project list unavailable");
+  return data;
+}
+
+async function validateWorkspace(path) {
+  try {
+    const response = await fetch(VALIDATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    return await response.json();
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
+}
+
+// Everything the popup needs to render the project selector. When the
+// webhook is unreachable this resolves to {available:false}: the popup then
+// pins the selector to the general workspace and omits `workspace` from the
+// payload (the exact pre-1.6 behavior).
+async function buildProjectContext(pageUrl) {
+  const domain = hostnameOf(pageUrl);
+  let list;
+  try {
+    list = await fetchProjectList();
+  } catch {
+    return { available: false, domain };
+  }
+  const memory = await getProjectMemory();
+  let auto = {
+    path: list.general.path,
+    name: list.general.name,
+    source: "default",
+  };
+  const mapped = memory.byDomain[domain];
+  if (mapped) {
+    const known = findProjectIn(list, mapped);
+    if (known) {
+      auto = { ...known, source: "site" };
+    } else {
+      // A remembered custom folder: confirm it is still valid before
+      // trusting it. Uncertain → stay on the general workspace.
+      const checked = await validateWorkspace(mapped);
+      if (checked?.ok) {
+        auto = { path: checked.path, name: checked.name, source: "site" };
+      }
+    }
+  }
+  const recents = memory.recents
+    .filter((path) => path !== list.general.path)
+    .map(
+      (path) =>
+        findProjectIn(list, path) || {
+          path,
+          name: path.split("/").filter(Boolean).pop() || path,
+        },
+    )
+    .slice(0, MAX_RECENTS_SHOWN);
+  return {
+    available: true,
+    domain,
+    general: list.general,
+    projects: list.projects || [],
+    recents,
+    auto,
+  };
+}
+
 // Keep localhost access in the extension service worker. Page scripts never
 // receive direct CORS access to the Forwarder, so an arbitrary website cannot
 // start a background job or open desktop sessions on the user's behalf.
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "forward-request" || !message.payload) return false;
+  if (message?.type === "forward-request" && message.payload) {
+    (async () => {
+      try {
+        const response = await fetch(WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(message.payload),
+        });
+        const data = await response.json();
+        if (data?.ok && message.project?.path) {
+          const memory = await getProjectMemory();
+          await saveProjectMemory(
+            applyProjectSelection(memory, message.project),
+          );
+        }
+        sendResponse({ transportOk: true, data });
+      } catch (error) {
+        sendResponse({ transportOk: false, error: String(error) });
+      }
+    })();
+    return true;
+  }
 
-  fetch(WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(message.payload),
-  })
-    .then(async (response) => {
-      const data = await response.json();
-      sendResponse({ transportOk: true, data });
-    })
-    .catch((error) => {
-      sendResponse({ transportOk: false, error: String(error) });
-    });
-  return true;
+  if (message?.type === "validate-workspace") {
+    validateWorkspace(message.path).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "clear-project-mapping") {
+    (async () => {
+      const memory = await getProjectMemory();
+      delete memory.byDomain[message.domain];
+      await saveProjectMemory(memory);
+      sendResponse({ ok: true });
+    })().catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  return false;
 });
 
 // Template prompts shown as quick-select buttons in the popup, in priority
@@ -89,6 +259,10 @@ chrome.commands.onCommand.addListener(async (command) => {
     web: "web-content.js",
   }[source];
 
+  // Resolve the project selector's contents up front so the popup renders
+  // complete (never blocks the popup: unavailable backend degrades cleanly).
+  const projectContext = await buildProjectContext(url);
+
   try {
     // Capture selected text first
     const selResults = await chrome.scripting.executeScript({
@@ -123,22 +297,22 @@ chrome.commands.onCommand.addListener(async (command) => {
       finalUrl = url.replace(/\/client\/[^/]+.*/, `/client/${url.match(/T[A-Z0-9]+/)?.[0] || ""}/` + channel_id + "/thread/" + channel_id + "-" + thread_ts);
     }
 
-    showPopup(tab.id, source, finalUrl, extracted || null);
+    showPopup(tab.id, source, finalUrl, extracted || null, projectContext);
   } catch (err) {
     console.error("Content script injection failed:", err);
-    showPopup(tab.id, source, url, null);
+    showPopup(tab.id, source, url, null, projectContext);
   }
 });
 
-function showPopup(tabId, source, url, extracted) {
+function showPopup(tabId, source, url, extracted, projectContext) {
   chrome.scripting.executeScript({
     target: { tabId },
     func: injectInstructionPopup,
-    args: [source, url, extracted, TEMPLATES, DESTINATIONS],
+    args: [source, url, extracted, TEMPLATES, DESTINATIONS, projectContext || null],
   });
 }
 
-function injectInstructionPopup(source, url, extracted, templates, destinations) {
+function injectInstructionPopup(source, url, extracted, templates, destinations, projectContext) {
   // Remove existing popup if any
   const existing = document.getElementById("claude-forwarder-popup");
   if (existing) existing.remove();
@@ -180,6 +354,7 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
         background: #fcfbf8; border: 1px solid rgba(255,255,255,0.7);
         border-radius: 18px; padding: 22px;
         width: 460px; max-width: 92vw;
+        max-height: 92vh; overflow-y: auto;
         box-shadow: 0 24px 80px rgba(17,24,39,0.28);
       }
       .header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
@@ -227,6 +402,37 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
         font-size: 11px; line-height: 1.3;
       }
       .destination[aria-pressed="true"] .destination-detail { color: #cfcac1; }
+      .project-select {
+        width: 100%; padding: 7px 9px; font: inherit; font-size: 13px;
+        color: #292724; background: rgba(255,255,255,.85);
+        border: 1px solid #ddd9d1; border-radius: 9px; cursor: pointer;
+      }
+      .project-select:disabled { color: #8a857c; cursor: default; }
+      .project-select:focus-visible { outline: 2px solid #171717; outline-offset: 1px; }
+      .project-info {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 10px; margin-top: 5px; min-height: 15px;
+      }
+      .project-path {
+        font-size: 11px; color: #8a857c; overflow: hidden;
+        text-overflow: ellipsis; white-space: nowrap;
+      }
+      .project-clear {
+        flex: 0 0 auto; font-family: inherit; font-size: 11px; color: #92600a;
+        background: none; border: none; padding: 0; cursor: pointer;
+        text-decoration: underline;
+      }
+      .project-clear:hover { color: #6d4707; }
+      .project-custom { margin-top: 6px; }
+      .project-custom input {
+        width: 100%; padding: 7px 9px; font-size: 12px; color: #333;
+        font-family: ui-monospace, Menlo, monospace;
+        border: 1px solid #ddd9d1; border-radius: 8px; background: white;
+      }
+      .project-custom input::placeholder { color: #999; font-family: inherit; }
+      .project-error {
+        display: none; margin-top: 4px; font-size: 11px; color: #dc2626;
+      }
       .templates {
         display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
       }
@@ -280,6 +486,21 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
         ${extracted?.subject ? `<div class="subject">${escapeHtml(extracted.subject)}</div>` : ""}
         <div class="section-label">Open in</div>
         <div class="destinations" id="destinations"></div>
+        <div id="project-section">
+          <div class="section-label">Project</div>
+          <select class="project-select" id="project-select" aria-label="Project to open the session in"></select>
+          <div class="project-custom" id="project-custom" style="display:none">
+            <input id="project-custom-input" type="text" spellcheck="false"
+              placeholder="/path/to/project — Enter to confirm"
+              aria-label="Project folder path">
+            <div class="project-error" id="project-error" role="alert"></div>
+          </div>
+          <div class="project-info">
+            <span class="project-path" id="project-path"></span>
+            <button type="button" class="project-clear" id="project-clear"
+              style="display:none" title="Stop remembering this project for this site">Forget for this site</button>
+          </div>
+        </div>
         <div class="section-label">Instruction</div>
         <div class="templates" id="templates"></div>
         <textarea id="instruction" placeholder="Add instruction (e.g. draft reply, summarize, research this...)"></textarea>
@@ -307,6 +528,145 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
   const textarea = shadow.getElementById("instruction");
   let selectedDestination = "claude";
 
+  // ── Project selector ───────────────────────────────────────────
+  const ctx = projectContext && projectContext.available ? projectContext : null;
+  const projectSection = shadow.getElementById("project-section");
+  const projectSelect = shadow.getElementById("project-select");
+  const customBox = shadow.getElementById("project-custom");
+  const customInput = shadow.getElementById("project-custom-input");
+  const projectErrorEl = shadow.getElementById("project-error");
+  const projectPathEl = shadow.getElementById("project-path");
+  const projectClearBtn = shadow.getElementById("project-clear");
+  const projectNames = {};
+  let autoOption = null;
+  let chooseOption = null;
+
+  function shortenPath(path) {
+    return String(path || "").replace(/^\/Users\/[^/]+/, "~");
+  }
+
+  if (!ctx) {
+    projectSelect.appendChild(new Option("General workspace (default)", "__general__"));
+    projectSelect.disabled = true;
+    projectPathEl.textContent = "Project list unavailable — opens in the general workspace";
+  } else {
+    autoOption = new Option(`Auto · ${ctx.auto.name}`, "__auto__");
+    projectSelect.appendChild(autoOption);
+    projectSelect.appendChild(new Option(ctx.general.name, "__general__"));
+    projectNames[ctx.general.path] = ctx.general.name;
+    const recentPaths = new Set();
+    if (ctx.recents.length) {
+      const group = document.createElement("optgroup");
+      group.label = "Recent";
+      ctx.recents.forEach((project) => {
+        recentPaths.add(project.path);
+        projectNames[project.path] = project.name;
+        group.appendChild(new Option(project.name, project.path));
+      });
+      projectSelect.appendChild(group);
+    }
+    const discovered = (ctx.projects || []).filter(
+      (project) => !recentPaths.has(project.path),
+    );
+    if (discovered.length) {
+      const group = document.createElement("optgroup");
+      group.label = "Projects";
+      discovered.forEach((project) => {
+        projectNames[project.path] = project.name;
+        group.appendChild(new Option(project.name, project.path));
+      });
+      projectSelect.appendChild(group);
+    }
+    chooseOption = new Option("Choose folder…", "__choose__");
+    projectSelect.appendChild(chooseOption);
+  }
+
+  function currentProject() {
+    if (!ctx) return null;
+    const value = projectSelect.value;
+    if (value === "__auto__") {
+      return { path: ctx.auto.path, name: ctx.auto.name, explicit: false };
+    }
+    if (value === "__general__") {
+      return { path: ctx.general.path, name: ctx.general.name, explicit: true };
+    }
+    if (value === "__choose__") return null;
+    return { path: value, name: projectNames[value] || value, explicit: true };
+  }
+
+  function updateProjectDisplay() {
+    if (!ctx) return;
+    const choosing = projectSelect.value === "__choose__";
+    customBox.style.display = choosing ? "block" : "none";
+    if (choosing) {
+      projectPathEl.textContent = "Paste a project folder path, then press Enter";
+      projectPathEl.removeAttribute("title");
+      projectClearBtn.style.display = "none";
+      customInput.focus();
+      return;
+    }
+    projectErrorEl.style.display = "none";
+    const project = currentProject();
+    projectPathEl.textContent = project ? `Opens in ${shortenPath(project.path)}` : "";
+    if (project) projectPathEl.title = project.path;
+    projectClearBtn.style.display =
+      projectSelect.value === "__auto__" && ctx.auto.source === "site" ? "" : "none";
+  }
+
+  async function confirmCustomPath() {
+    const raw = customInput.value.trim();
+    if (!raw) return;
+    projectErrorEl.style.display = "none";
+    customInput.disabled = true;
+    let result;
+    try {
+      result = await chrome.runtime.sendMessage({
+        type: "validate-workspace",
+        path: raw,
+      });
+    } catch (error) {
+      result = { ok: false, error: "Forwarder unavailable (localhost:5581)" };
+    }
+    customInput.disabled = false;
+    if (!result?.ok) {
+      projectErrorEl.textContent = result?.error || "Folder not allowed";
+      projectErrorEl.style.display = "block";
+      customInput.focus();
+      return;
+    }
+    projectNames[result.path] = result.name;
+    let option = Array.from(projectSelect.options).find(
+      (candidate) => candidate.value === result.path,
+    );
+    if (!option) {
+      option = new Option(result.name, result.path);
+      projectSelect.insertBefore(option, chooseOption);
+    }
+    projectSelect.value = result.path;
+    customInput.value = "";
+    updateProjectDisplay();
+    projectSelect.focus();
+  }
+
+  projectSelect.addEventListener("change", updateProjectDisplay);
+
+  projectClearBtn.addEventListener("click", async () => {
+    try {
+      await chrome.runtime.sendMessage({
+        type: "clear-project-mapping",
+        domain: ctx.domain,
+      });
+    } catch (error) {
+      // Memory clearing is best-effort; the visible state still resets.
+    }
+    ctx.auto = { path: ctx.general.path, name: ctx.general.name, source: "default" };
+    if (autoOption) autoOption.textContent = `Auto · ${ctx.auto.name}`;
+    updateProjectDisplay();
+  });
+
+  updateProjectDisplay();
+
+  // ── Destinations ───────────────────────────────────────────────
   const destinationRow = shadow.getElementById("destinations");
   const destinationButtons = [];
   (destinations || []).forEach((destination) => {
@@ -345,7 +705,12 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
     sendBtn.textContent = id === "claude_headless"
       ? "Run in background"
       : `Open new ${selected?.name || "desktop"} session`;
+    // Background jobs always run in the general workspace — the project
+    // selector only applies to desktop sessions.
+    projectSection.style.display = id === "claude_headless" ? "none" : "";
   }
+
+  selectDestination(selectedDestination);
 
   // Template quick-select buttons
   const tplRow = shadow.getElementById("templates");
@@ -409,20 +774,26 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
   // Also intercept at document level to prevent Slack from stealing keys
   function blockSlackKeys(e) {
     if (!document.getElementById("claude-forwarder-popup")) return;
+    const target = e.composedPath ? e.composedPath()[0] : e.target;
     if (e.key === "Escape") {
       host.remove();
       e.preventDefault();
       e.stopPropagation();
       return;
     }
-    // Enter = send (Shift+Enter = newline)
+    // Enter = send (Shift+Enter = newline); in the folder-path box it
+    // confirms the typed path instead.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
-      shadow.getElementById("send")?.click();
+      if (e.type === "keydown") {
+        if (target === customInput) confirmCustomPath();
+        else shadow.getElementById("send")?.click();
+      }
       return;
     }
-    if (e.type === "keydown" && digitPicksTemplate(e)) {
+    const typingContext = target === customInput || target === projectSelect;
+    if (e.type === "keydown" && !typingContext && digitPicksTemplate(e)) {
       e.preventDefault();
     }
     e.stopPropagation();
@@ -444,6 +815,18 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
 
   sendBtn.addEventListener("click", async () => {
     const instruction = textarea.value.trim();
+    const isDesktop = selectedDestination !== "claude_headless";
+
+    let project = null;
+    if (isDesktop && ctx) {
+      project = currentProject();
+      if (!project) {
+        statusEl.style.display = "block";
+        statusEl.style.color = "#dc2626";
+        statusEl.textContent = "Confirm the folder path first (press Enter in the path box), or pick a project.";
+        return;
+      }
+    }
 
     sendBtn.disabled = true;
     sendBtn.textContent = selectedDestination === "claude_headless" ? "Starting..." : "Opening...";
@@ -461,6 +844,7 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
       instruction: instruction || "",
       destination: selectedDestination,
     };
+    if (project) payload.workspace = project.path;
 
     if (extracted) {
       if (extracted.subject) payload.subject = extracted.subject;
@@ -473,11 +857,18 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
       if (extracted.hint) payload.hint = extracted.hint;
     }
 
+    const message = { type: "forward-request", payload };
+    if (project) {
+      message.project = {
+        domain: ctx.domain,
+        path: project.path,
+        explicit: project.explicit,
+        generalPath: ctx.general.path,
+      };
+    }
+
     try {
-      const relay = await chrome.runtime.sendMessage({
-        type: "forward-request",
-        payload,
-      });
+      const relay = await chrome.runtime.sendMessage(message);
       if (!relay?.transportOk) {
         throw new Error(relay?.error || "Forwarder service worker unavailable");
       }
@@ -485,9 +876,12 @@ function injectInstructionPopup(source, url, extracted, templates, destinations)
 
       if (data.ok) {
         statusEl.style.color = "#16a34a";
+        const openedIn = data.workspace
+          ? ` in ${data.workspace.split("/").filter(Boolean).pop()}`
+          : "";
         statusEl.textContent = selectedDestination === "claude_headless"
           ? `Started in background · ${data.session_name}`
-          : `${destination?.name || "Desktop"} opened · review and press Enter`;
+          : `${destination?.name || "Desktop"} opened${openedIn} · review and press Enter`;
         setTimeout(() => host.remove(), 1500);
       } else {
         statusEl.style.color = "#dc2626";

@@ -14,9 +14,12 @@ Interactive handoffs stay in the new desktop session you chose. Background jobs 
 Any page (browser)
   → Cmd+Shift+F
   → Popup: choose Claude Code / Codex / Background
+  → Desktop modes: Project selector (Auto · <resolved project> by default)
   → Pick a template button or type an instruction → Enter
   → Local webhook receives content
   ├→ Desktop: writes a private work packet → opens a new native app session
+  │  inside the selected project (AGENTS.md/CLAUDE.md, Git state, skills,
+  │  and local context all come from that repo)
   │  (the prompt is prefilled, not auto-submitted; you review and press Enter)
   └→ Background: spawns headless Claude Code (claude -p) in tmux
      (max 2 in parallel; failures retry automatically up to 3 attempts)
@@ -95,6 +98,22 @@ Choose the destination at the top of the popup. Template buttons sit above the i
 | **Codex** | Opens a new Codex Desktop local session with the task prefilled |
 | **Background** | Runs the existing autonomous `claude -p` job and reports through `✳` |
 
+### The Project selector
+
+For Claude Code and Codex, a compact **Project** dropdown sits under the destination row. The session opens *inside* that repository, so the agent immediately inherits its `AGENTS.md` / `CLAUDE.md`, Git state, skills, and local context. Claude Code and Codex share one project list — it's task context, not app configuration.
+
+- **Auto · \<project\>** (default) — no clicking needed. Auto resolves to the project you last explicitly picked for this site (e.g. always open Jira forwards in `repo-a`); with no site memory it resolves to the **General workspace**. The exact folder that will open is always shown under the dropdown.
+- **General workspace** — the classic `FORWARDER_WORKSPACE` behavior.
+- **Recent** — your last few explicitly used projects.
+- **Projects** — auto-discovered: directories up to two levels under the configured roots that look like projects (`.git`, `CLAUDE.md`, `AGENTS.md`, `package.json`, …). No home-directory-wide scanning, hidden/vendor/`_archive` dirs are skipped.
+- **Choose folder…** — paste any path; the webhook validates it server-side before it's accepted.
+
+Picking a project explicitly and forwarding remembers it for that site (per-domain). Auto forwards never change the memory. To stop remembering, select Auto and click **Forget for this site**. Explicitly forwarding a site with **General workspace** also clears its memory.
+
+Every workspace is re-validated server-side on each forward: real paths only, the directory must exist, and it must sit inside `FORWARDER_PROJECT_ROOTS` (or be listed in `FORWARDER_EXTRA_PROJECTS`). Traversal (`..`) and symlink escapes are resolved and rejected. If the webhook is unreachable, the popup pins the selector to the General workspace and forwards exactly like pre-1.6.
+
+Background mode hides the selector — headless jobs always run in the general workspace, where the draft-first skills live.
+
 Desktop links deliberately do not auto-submit. This leaves one visible approval point: review the short packet instruction and press Enter. Full forwarded content is stored in a private local Markdown packet (`0600`) instead of being squeezed into the URL. Packets expire after 30 days by default.
 
 | Key | Action |
@@ -152,17 +171,20 @@ Without these, Claude Code can still read the forwarded DOM content, but won't b
 │  • web-content.js (any)   │
 │                           │
 │  Cmd+Shift+F → extract →  │
-│  popup (target+template) →│
-│  POST /forward            │
+│  popup (target+project+   │
+│  template) → POST /forward│
 └───────────┬──────────────┘
             │ localhost:5581
 ┌───────────▼──────────────┐      ┌──────────────────────────┐
 │   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps)  │
 │                           │ poll │                           │
 │  POST /forward            │ 3s   │  • running/queued/done/err│
-│    → private work packet  │      │  • Terminate / Cancel     │
-│      + native deep link   │      │  • View job log           │
-│    OR queue + claude -p   │      └──────────────────────────┘
+│    → validate workspace   │      │  • Terminate / Cancel     │
+│    → private work packet  │      │  • View job log           │
+│      + native deep link   │      └──────────────────────────┘
+│    OR queue + claude -p   │
+│  GET  /projects           │
+│  POST /projects/validate  │
 │  GET  /status             │
 │  POST /terminate/<id>     │
 │  POST /clear-finished     │
@@ -193,12 +215,16 @@ Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist`
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `PORT` | `5581` | Webhook port (menu bar app reads the same var) |
-| `FORWARDER_WORKSPACE` | `~/claude` | Directory Claude Code runs in (your CLAUDE.md, skills, MCP config) |
+| `FORWARDER_WORKSPACE` | `~/claude` | General workspace: background jobs and the default desktop target (your CLAUDE.md, skills, MCP config) |
+| `FORWARDER_PROJECT_ROOTS` | `FORWARDER_WORKSPACE` | Colon-separated roots the project selector may open; scanned two levels deep for project directories |
+| `FORWARDER_EXTRA_PROJECTS` | *(none)* | Colon-separated individual project dirs allowed *outside* the roots (exact match, no subdirectories) |
 | `FORWARDER_MODEL` | `opus` | Model for spawned sessions |
 | `FORWARDER_EFFORT` | `high` | Effort level for spawned sessions |
 | `FORWARDER_MAX_CONCURRENT` | `2` | Parallel Claude sessions; extra forwards queue FIFO |
 | `FORWARDER_PACKETS_DIR` | `~/Library/Application Support/Claude Code Forwarder/Inbox` | Private interactive handoff packets |
 | `FORWARDER_PACKET_TTL_DAYS` | `30` | Remove old packet files after this many days; `0` disables pruning |
+
+**Upgrading from ≤ 1.5:** no config change required. Restart the webhook service (unload + load below) and reload the extension in `chrome://extensions` to get the project selector. Old clients and payloads without a `workspace` keep opening in `FORWARDER_WORKSPACE` exactly as before. Set `FORWARDER_PROJECT_ROOTS` only if your repos live outside `~/claude`.
 
 **Keyboard shortcut:** change in `chrome://extensions/shortcuts`, keep scope **Global**.
 
@@ -223,6 +249,7 @@ curl -s -X POST http://localhost:5581/forward \
 ```bash
 .venv/bin/python3 -m unittest discover -s tests -v
 node tests/test_extension_service_worker.js
+node tests/test_extension_projects.js
 node --check extension/background.js
 ```
 

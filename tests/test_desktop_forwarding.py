@@ -22,14 +22,20 @@ SPEC.loader.exec_module(forwarder)
 class DesktopForwardingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.workspace = os.path.join(self.temp_dir.name, "workspace")
-        self.packets = os.path.join(self.temp_dir.name, "packets")
+        # realpath: macOS tempdirs live under /var → /private/var symlink
+        self.base = os.path.realpath(self.temp_dir.name)
+        self.workspace = os.path.join(self.base, "workspace")
+        self.packets = os.path.join(self.base, "packets")
         os.mkdir(self.workspace)
         self.old_packets_dir = forwarder.PACKETS_DIR
         self.old_workspace = forwarder.WORKSPACE_DIR
+        self.old_roots = forwarder.PROJECT_ROOTS
+        self.old_extra = forwarder.EXTRA_PROJECTS
         self.old_ttl = forwarder.PACKET_TTL_DAYS
         forwarder.PACKETS_DIR = self.packets
         forwarder.WORKSPACE_DIR = self.workspace
+        forwarder.PROJECT_ROOTS = [self.base]
+        forwarder.EXTRA_PROJECTS = []
         forwarder.PACKET_TTL_DAYS = 30
         forwarder.active_jobs.clear()
         forwarder.queued_jobs.clear()
@@ -39,6 +45,8 @@ class DesktopForwardingTests(unittest.TestCase):
     def tearDown(self):
         forwarder.PACKETS_DIR = self.old_packets_dir
         forwarder.WORKSPACE_DIR = self.old_workspace
+        forwarder.PROJECT_ROOTS = self.old_roots
+        forwarder.EXTRA_PROJECTS = self.old_extra
         forwarder.PACKET_TTL_DAYS = self.old_ttl
         self.temp_dir.cleanup()
 
@@ -97,7 +105,8 @@ class DesktopForwardingTests(unittest.TestCase):
         self.assertEqual(data["destination"], "codex")
         self.assertEqual(data["status"], "opened")
         self.assertTrue(os.path.isfile(data["packet_path"]))
-        opener.assert_called_once_with("codex", data["packet_path"])
+        self.assertEqual(data["workspace"], self.workspace)
+        opener.assert_called_once_with("codex", data["packet_path"], self.workspace)
 
     def test_invalid_destination_is_rejected_without_launching(self):
         client = forwarder.app.test_client()

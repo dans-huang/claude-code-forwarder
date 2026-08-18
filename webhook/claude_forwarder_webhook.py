@@ -11,7 +11,11 @@ Usage:
 
 Environment overrides:
   PORT                      webhook port                    (default 5581)
-  FORWARDER_WORKSPACE       Claude Code working directory   (default ~/claude)
+  FORWARDER_WORKSPACE       general workspace directory     (default ~/claude)
+  FORWARDER_PROJECT_ROOTS   colon-separated roots scanned for projects
+                            (default: the general workspace)
+  FORWARDER_EXTRA_PROJECTS  colon-separated project dirs allowed outside
+                            the roots (default: none)
   FORWARDER_MODEL           model for spawned sessions      (default opus)
   FORWARDER_EFFORT          effort for spawned sessions     (default high)
   FORWARDER_MAX_CONCURRENT  parallel jobs; rest queue FIFO  (default 2)
@@ -36,6 +40,30 @@ app = Flask(__name__)
 WORKSPACE_DIR = os.path.expanduser(
     os.environ.get("FORWARDER_WORKSPACE", "~/claude")
 )
+
+
+def _split_path_list(value):
+    return [os.path.expanduser(p.strip()) for p in (value or "").split(":") if p.strip()]
+
+
+# Where desktop sessions are allowed to open. Roots are scanned two levels
+# deep for project directories; EXTRA_PROJECTS are individual directories
+# outside the roots that the user has explicitly allowed. The browser never
+# gets to pick an arbitrary path: every requested workspace is realpath'd and
+# checked against this allowlist server-side.
+PROJECT_ROOTS = _split_path_list(os.environ.get("FORWARDER_PROJECT_ROOTS")) or [WORKSPACE_DIR]
+EXTRA_PROJECTS = _split_path_list(os.environ.get("FORWARDER_EXTRA_PROJECTS"))
+
+# A directory counts as a project when it carries one of these markers.
+PROJECT_MARKERS = (
+    ".git", "CLAUDE.md", "AGENTS.md", ".claude",
+    "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+)
+# Never descended into during discovery (hidden/_-prefixed names too).
+# Archived trees stay reachable via Choose folder…, just not listed.
+SKIP_DIR_NAMES = {"node_modules", "venv", "tmp", "dist", "build", "Library", "archive"}
+MAX_SCAN_ENTRIES = 512   # hard cap on directories examined per /projects call
+MAX_PROJECTS = 200
 
 # Interactive desktop handoffs keep the full forwarded context in a private,
 # local work packet. The URL only carries a short instruction pointing at the
@@ -250,7 +278,7 @@ def _prune_old_packets(now=None):
             continue
 
 
-def write_task_packet(payload, prompt, task_id):
+def write_task_packet(payload, prompt, task_id, workspace=None):
     """Atomically persist a private Markdown packet and return its full path."""
     _ensure_private_packets_dir()
     _prune_old_packets()
@@ -260,12 +288,14 @@ def write_task_packet(payload, prompt, task_id):
     filename = f"{stamp}-{source}-{task_id}.md"
     packet_path = os.path.join(PACKETS_DIR, filename)
     subject = (payload.get("subject") or "Forwarded task").strip()
+    workspace_line = f"- Workspace: `{workspace}`\n" if workspace else ""
     body = (
         "# Forwarded task\n\n"
         f"- Task ID: `{task_id}`\n"
         f"- Created: `{datetime.now(timezone.utc).isoformat()}`\n"
         f"- Source: `{payload.get('source', 'web')}`\n"
-        f"- Subject: {subject}\n\n"
+        f"- Subject: {subject}\n"
+        f"{workspace_line}\n"
         "## Task and context\n\n"
         f"{prompt}\n"
     )
@@ -285,13 +315,116 @@ def write_task_packet(payload, prompt, task_id):
     return packet_path
 
 
+class WorkspaceValidationError(ValueError):
+    """A requested workspace path failed server-side validation."""
+
+
+def resolve_workspace(raw_path=None):
+    """Validate a requested workspace and return its canonical real path.
+
+    Only the general workspace, directories inside the configured project
+    roots, and explicitly configured extra projects are allowed. The path is
+    fully resolved first (symlinks and `..` included), so traversal or a
+    symlink that escapes a root is rejected against the real target, never
+    the raw string the browser sent. No path given → the general workspace.
+    """
+    if raw_path is None or (isinstance(raw_path, str) and not raw_path.strip()):
+        raw_path = WORKSPACE_DIR
+    if not isinstance(raw_path, str):
+        raise WorkspaceValidationError("workspace must be a path string")
+    real = os.path.realpath(os.path.expanduser(raw_path.strip()))
+    if not os.path.isdir(real):
+        raise WorkspaceValidationError(f"workspace does not exist: {raw_path}")
+
+    allowed_exact = {
+        os.path.realpath(p) for p in [WORKSPACE_DIR, *EXTRA_PROJECTS]
+    }
+    if real in allowed_exact:
+        return real
+    for root in PROJECT_ROOTS:
+        root_real = os.path.realpath(root)
+        if not os.path.isdir(root_real):
+            continue
+        if os.path.commonpath([real, root_real]) == root_real:
+            return real
+    raise WorkspaceValidationError(
+        f"workspace is outside the allowed project roots: {raw_path}"
+    )
+
+
+def _iter_child_dirs(path):
+    """Immediate child directories worth scanning, skipping vendor/hidden dirs.
+
+    Symlinked directories are not followed — a symlink planted inside a root
+    cannot pull an outside tree into the discovered project list.
+    """
+    try:
+        entries = sorted(os.scandir(path), key=lambda entry: entry.name.lower())
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        if name.startswith(".") or name.startswith("_") or name in SKIP_DIR_NAMES:
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                yield entry.path
+        except OSError:
+            continue
+
+
+def _is_project_dir(path):
+    return any(
+        os.path.lexists(os.path.join(path, marker)) for marker in PROJECT_MARKERS
+    )
+
+
+def discover_projects():
+    """Project directories under the configured roots, two levels deep.
+
+    Deliberately bounded: no recursive walk of the home directory, a hard cap
+    on examined entries, and the general workspace itself is excluded (the
+    client renders it as its own fixed choice).
+    """
+    seen = {os.path.realpath(WORKSPACE_DIR)}
+    projects = []
+    scanned = 0
+
+    def add(path):
+        real = os.path.realpath(path)
+        if real in seen or not os.path.isdir(real):
+            return
+        seen.add(real)
+        projects.append({"name": os.path.basename(real) or real, "path": real})
+
+    for root in PROJECT_ROOTS:
+        root_real = os.path.realpath(root)
+        if not os.path.isdir(root_real):
+            continue
+        for child in _iter_child_dirs(root_real):
+            scanned += 1
+            if scanned > MAX_SCAN_ENTRIES or len(projects) >= MAX_PROJECTS:
+                break
+            if _is_project_dir(child):
+                add(child)
+                continue
+            for grandchild in _iter_child_dirs(child):
+                scanned += 1
+                if scanned > MAX_SCAN_ENTRIES or len(projects) >= MAX_PROJECTS:
+                    break
+                if _is_project_dir(grandchild):
+                    add(grandchild)
+    for extra in EXTRA_PROJECTS:
+        add(extra)
+    projects.sort(key=lambda project: project["name"].lower())
+    return projects
+
+
 def build_desktop_deep_link(destination, packet_path, workspace=None):
     """Build an official new-session deep link for Codex or Claude Code."""
     if destination not in DESKTOP_DESTINATIONS:
         raise ValueError(f"Unsupported desktop destination: {destination}")
-    workspace = os.path.abspath(os.path.expanduser(workspace or WORKSPACE_DIR))
-    if not os.path.isdir(workspace):
-        raise ValueError(f"Forwarder workspace does not exist: {workspace}")
+    workspace = resolve_workspace(workspace)
 
     handoff_prompt = (
         "Open and read this forwarded task packet:\n"
@@ -305,11 +438,11 @@ def build_desktop_deep_link(destination, packet_path, workspace=None):
     return "claude://code/new?" + urlencode({"q": handoff_prompt, "folder": workspace})
 
 
-def open_desktop_session(destination, packet_path):
+def open_desktop_session(destination, packet_path, workspace=None):
     """Open one new native desktop session without auto-submitting its prompt."""
     if not shutil.which("open"):
         raise RuntimeError("macOS 'open' command is unavailable")
-    deep_link = build_desktop_deep_link(destination, packet_path)
+    deep_link = build_desktop_deep_link(destination, packet_path, workspace)
     result = subprocess.run(
         ["open", deep_link],
         capture_output=True,
@@ -523,6 +656,12 @@ def forward():
     job_id = str(uuid.uuid4())[:8]
 
     if destination in DESKTOP_DESTINATIONS:
+        # Validate before writing anything: a bad workspace must fail loudly
+        # instead of silently opening the session in the wrong repository.
+        try:
+            workspace = resolve_workspace(payload.get("workspace"))
+        except WorkspaceValidationError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         desktop_payload = dict(payload)
         if test_mode:
             desktop_payload.update({
@@ -543,14 +682,21 @@ def forward():
             })
         prompt = build_prompt(desktop_payload, interactive=True)
         try:
-            packet_path = write_task_packet(desktop_payload, prompt, job_id)
-            open_desktop_session(destination, packet_path)
+            packet_path = write_task_packet(
+                desktop_payload, prompt, job_id, workspace=workspace
+            )
+            deep_link = open_desktop_session(destination, packet_path, workspace)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             return jsonify({
                 "ok": False,
                 "error": f"Could not open {DESKTOP_DESTINATIONS[destination]}: {exc}",
             }), 500
         session_name = f"desktop-{destination}-{job_id}"
+        print(
+            f"[forward] {destination} session {session_name} "
+            f"workspace={workspace} link={deep_link[:120]}...",
+            flush=True,
+        )
         return jsonify({
             "ok": True,
             "job_id": job_id,
@@ -558,8 +704,10 @@ def forward():
             "destination": destination,
             "status": "opened",
             "packet_path": packet_path,
+            "workspace": workspace,
             "message": (
-                f"Opened a new {DESKTOP_DESTINATIONS[destination]} session. "
+                f"Opened a new {DESKTOP_DESTINATIONS[destination]} session in "
+                f"{os.path.basename(workspace) or workspace}. "
                 "Review the prefilled task and press Enter to start."
             ),
         }), 201
@@ -600,6 +748,39 @@ def forward():
         "status": job["status"],
         "message": message,
     }), 202
+
+
+@app.route("/projects", methods=["GET"])
+def projects():
+    """Allowed workspaces for the extension's project selector.
+
+    Localhost-only like every other route, and no CORS headers are ever
+    added — web pages cannot read this; only the extension service worker.
+    """
+    return jsonify({
+        "ok": True,
+        "general": {
+            "name": "General workspace",
+            "path": os.path.realpath(WORKSPACE_DIR),
+        },
+        "projects": discover_projects(),
+        "roots": [os.path.realpath(root) for root in PROJECT_ROOTS],
+    })
+
+
+@app.route("/projects/validate", methods=["POST"])
+def validate_project():
+    """Validate one user-supplied folder (the popup's Choose folder… flow)."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        real = resolve_workspace(payload.get("path"))
+    except WorkspaceValidationError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({
+        "ok": True,
+        "path": real,
+        "name": os.path.basename(real) or real,
+    })
 
 
 @app.route("/status", methods=["GET"])
@@ -671,6 +852,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"  Listening: http://localhost:{port}")
     print(f"  Workspace: {WORKSPACE_DIR}")
+    print(f"  Roots:     {':'.join(PROJECT_ROOTS)}")
     print(f"  Model:     {CLAUDE_MODEL} (effort: {CLAUDE_EFFORT})")
     print(f"  Parallel:  {MAX_CONCURRENT} (excess jobs queue FIFO)")
     print(f"  Jobs dir:  {JOBS_DIR}")

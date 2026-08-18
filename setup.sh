@@ -220,6 +220,7 @@ echo "  Background jobs run headless — watch the ✳ menu bar item for status.
 echo ""
 echo "  Config (env vars in the webhook plist):"
 echo "    FORWARDER_MODEL=opus  FORWARDER_EFFORT=high  FORWARDER_WORKSPACE=~/claude"
+echo "    FORWARDER_PROJECT_ROOTS=~/claude  FORWARDER_EXTRA_PROJECTS=  (project selector)"
 echo ""
 echo "  To stop everything:"
 echo "    launchctl unload $WEBHOOK_PLIST_PATH"
