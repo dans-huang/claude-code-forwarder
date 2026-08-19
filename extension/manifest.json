@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Code Forwarder",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Forward any page into a new Claude Code or Codex desktop session — opened inside the right project — or run it in the background",
   "permissions": [
     "activeTab",

@@ -1,6 +1,7 @@
 const WEBHOOK_URL = "http://localhost:5581/forward";
 const PROJECTS_URL = "http://localhost:5581/projects";
 const VALIDATE_URL = "http://localhost:5581/projects/validate";
+const STATUS_URL = "http://localhost:5581/status";
 
 const DESTINATIONS = [
   {
@@ -18,7 +19,7 @@ const DESTINATIONS = [
   {
     id: "claude_headless",
     name: "Background",
-    detail: "Run autonomously with Claude",
+    detail: "Runs headless; notifies when done",
     mark: "↗",
   },
 ];
@@ -167,6 +168,24 @@ async function buildProjectContext(pageUrl) {
   };
 }
 
+// Background jobs are headless and finish with a system notification. The
+// popup only reports what is in flight right now, so a running job is still
+// visible at a glance without a permanently polling menu bar app.
+async function fetchBackgroundJobs() {
+  try {
+    const response = await fetch(STATUS_URL);
+    const data = await response.json();
+    if (!data?.ok) return null;
+    return {
+      running: data.active_jobs || 0,
+      queued: data.queued_jobs || 0,
+      errors: data.error_jobs || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Keep localhost access in the extension service worker. Page scripts never
 // receive direct CORS access to the Forwarder, so an arbitrary website cannot
 // start a background job or open desktop sessions on the user's behalf.
@@ -259,9 +278,13 @@ chrome.commands.onCommand.addListener(async (command) => {
     web: "web-content.js",
   }[source];
 
-  // Resolve the project selector's contents up front so the popup renders
-  // complete (never blocks the popup: unavailable backend degrades cleanly).
-  const projectContext = await buildProjectContext(url);
+  // Resolve the project selector and background-job state up front so the
+  // popup renders complete. Both degrade cleanly when the webhook is down,
+  // and they run together so the popup is not delayed twice.
+  const [projectContext, backgroundJobs] = await Promise.all([
+    buildProjectContext(url),
+    fetchBackgroundJobs(),
+  ]);
 
   try {
     // Capture selected text first
@@ -297,22 +320,25 @@ chrome.commands.onCommand.addListener(async (command) => {
       finalUrl = url.replace(/\/client\/[^/]+.*/, `/client/${url.match(/T[A-Z0-9]+/)?.[0] || ""}/` + channel_id + "/thread/" + channel_id + "-" + thread_ts);
     }
 
-    showPopup(tab.id, source, finalUrl, extracted || null, projectContext);
+    showPopup(tab.id, source, finalUrl, extracted || null, projectContext, backgroundJobs);
   } catch (err) {
     console.error("Content script injection failed:", err);
-    showPopup(tab.id, source, url, null, projectContext);
+    showPopup(tab.id, source, url, null, projectContext, backgroundJobs);
   }
 });
 
-function showPopup(tabId, source, url, extracted, projectContext) {
+function showPopup(tabId, source, url, extracted, projectContext, backgroundJobs) {
   chrome.scripting.executeScript({
     target: { tabId },
     func: injectInstructionPopup,
-    args: [source, url, extracted, TEMPLATES, DESTINATIONS, projectContext || null],
+    args: [
+      source, url, extracted, TEMPLATES, DESTINATIONS,
+      projectContext || null, backgroundJobs || null,
+    ],
   });
 }
 
-function injectInstructionPopup(source, url, extracted, templates, destinations, projectContext) {
+function injectInstructionPopup(source, url, extracted, templates, destinations, projectContext, backgroundJobs) {
   // Remove existing popup if any
   const existing = document.getElementById("claude-forwarder-popup");
   if (existing) existing.remove();
@@ -329,6 +355,14 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
     : extracted
       ? `${msgCount} message${msgCount !== 1 ? "s" : ""} extracted`
       : "Will fetch via MCP (DOM extraction failed)";
+
+  // Only worth showing when something is actually in flight; an idle line
+  // would just be noise on every forward.
+  const jobParts = [];
+  if (backgroundJobs?.running) jobParts.push(`${backgroundJobs.running} running`);
+  if (backgroundJobs?.queued) jobParts.push(`${backgroundJobs.queued} queued`);
+  if (backgroundJobs?.errors) jobParts.push(`${backgroundJobs.errors} failed`);
+  const jobsText = jobParts.length ? `Background: ${jobParts.join(" · ")}` : "";
 
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
@@ -433,6 +467,16 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
       .project-error {
         display: none; margin-top: 4px; font-size: 11px; color: #dc2626;
       }
+      .jobs-note {
+        display: flex; align-items: center; gap: 6px; margin-bottom: 12px;
+        padding: 7px 9px; border-radius: 8px;
+        background: #f4f1ea; color: #6b675f;
+        font-size: 12px; line-height: 1.3;
+      }
+      .jobs-note .dot {
+        width: 6px; height: 6px; border-radius: 50%; background: #92600a;
+        flex: 0 0 auto;
+      }
       .templates {
         display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
       }
@@ -484,6 +528,7 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
           Source: <strong>${escapeHtml(source)}</strong> &middot; ${escapeHtml(statusText)}
         </div>
         ${extracted?.subject ? `<div class="subject">${escapeHtml(extracted.subject)}</div>` : ""}
+        ${jobsText ? `<div class="jobs-note"><span class="dot"></span>${escapeHtml(jobsText)}</div>` : ""}
         <div class="section-label">Open in</div>
         <div class="destinations" id="destinations"></div>
         <div id="project-section">

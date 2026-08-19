@@ -3,7 +3,7 @@ set -e
 
 # ─────────────────────────────────────────────
 #  Claude Code Forwarder — One-Click Setup
-#  Installs: webhook service + menu bar app
+#  Installs: webhook service
 #  Manual:   Chrome extension (2 steps, guided)
 # ─────────────────────────────────────────────
 
@@ -15,11 +15,10 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEBHOOK_DIR="$SCRIPT_DIR/webhook"
-MENUBAR_DIR="$SCRIPT_DIR/menubar"
 WEBHOOK_PLIST_NAME="com.claude-code-forwarder.webhook"
-MENUBAR_PLIST_NAME="com.claude-code-forwarder.menubar"
 WEBHOOK_PLIST_PATH="$HOME/Library/LaunchAgents/$WEBHOOK_PLIST_NAME.plist"
-MENUBAR_PLIST_PATH="$HOME/Library/LaunchAgents/$MENUBAR_PLIST_NAME.plist"
+# Retired in 1.7.0; removed on upgrade (see "Retire the menu bar app" below)
+MENUBAR_PLIST_PATH="$HOME/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist"
 VENV_DIR="$SCRIPT_DIR/.venv"
 PYTHON3="$VENV_DIR/bin/python3"
 
@@ -60,10 +59,10 @@ if [ ! -x "$PYTHON3" ]; then
     echo -e "${YELLOW}Creating Python venv...${NC}"
     python3 -m venv "$VENV_DIR"
 fi
-if ! "$PYTHON3" -c "import flask, rumps" &>/dev/null; then
-    echo -e "${YELLOW}Installing Python deps (flask, rumps)...${NC}"
+if ! "$PYTHON3" -c "import flask" &>/dev/null; then
+    echo -e "${YELLOW}Installing Python deps (flask)...${NC}"
     "$PYTHON3" -m pip install -q --upgrade pip
-    "$PYTHON3" -m pip install -q -r "$WEBHOOK_DIR/requirements.txt" -r "$MENUBAR_DIR/requirements.txt"
+    "$PYTHON3" -m pip install -q -r "$WEBHOOK_DIR/requirements.txt"
 fi
 echo -e "${GREEN}✓${NC} Python deps (venv: $VENV_DIR)"
 
@@ -112,44 +111,15 @@ else
     exit 1
 fi
 
-# ─── Install menu bar app as launchd service ─
-echo ""
-echo -e "${BOLD}Setting up menu bar app...${NC}"
-
-launchctl unload "$MENUBAR_PLIST_PATH" 2>/dev/null || true
-
-cat > "$MENUBAR_PLIST_PATH" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${MENUBAR_PLIST_NAME}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${PYTHON3}</string>
-        <string>${MENUBAR_DIR}/claude_forwarder_menubar.py</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/claude-forwarder-menubar.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/claude-forwarder-menubar.log</string>
-</dict>
-</plist>
-PLIST
-
-launchctl load "$MENUBAR_PLIST_PATH"
-
-sleep 2
-if pgrep -f "claude_forwarder_menubar.py" &>/dev/null; then
-    echo -e "${GREEN}✓${NC} Menu bar app running — look for ✳ in your menu bar"
-else
-    echo -e "${RED}✗${NC} Menu bar app failed. Check: /tmp/claude-forwarder-menubar.log"
-    exit 1
+# ─── Retire the menu bar app (upgrade from ≤1.6) ─
+# The ✳ app polled /status every 3s just to render an icon that was blank
+# most of the time. Background jobs now post a notification when they end.
+if [ -f "$MENUBAR_PLIST_PATH" ]; then
+    echo ""
+    echo -e "${BOLD}Removing the retired menu bar app...${NC}"
+    launchctl unload "$MENUBAR_PLIST_PATH" 2>/dev/null || true
+    rm -f "$MENUBAR_PLIST_PATH"
+    echo -e "${GREEN}✓${NC} Menu bar service removed — jobs now notify you when they finish"
 fi
 
 # ─── Smoke test ──────────────────────────────
@@ -158,8 +128,7 @@ echo -e "${BOLD}Running smoke test...${NC}"
 RESP=$(curl -s -X POST http://localhost:5581/forward \
     -H "Content-Type: application/json" -d '{"_test": true}')
 if echo "$RESP" | grep -q '"ok":true'; then
-    echo -e "${GREEN}✓${NC} Test job launched — watch ✳ in the menu bar show '✳ 1'"
-    echo "  then flip back to ✳ (done) within ~10 seconds"
+    echo -e "${GREEN}✓${NC} Test job launched — a notification appears when it finishes (~10s)"
 else
     echo -e "${RED}✗${NC} Smoke test failed: $RESP"
     exit 1
@@ -213,10 +182,11 @@ echo "  • Gmail/Slack thread → extracts thread, full content via MCP"
 echo "  • Plaud recording    → file id via URL, transcript via plaud MCP"
 echo "  • Select text        → sends only the selection"
 echo "  • Choose Claude Code, Codex, or Background for each forward"
+echo "  • Pick the project the session opens in (defaults to Auto)"
 echo "  • Pick a template button or type your own instruction"
 echo ""
 echo "  Desktop handoffs open a new interactive session for review."
-echo "  Background jobs run headless — watch the ✳ menu bar item for status."
+echo "  Background jobs run headless and notify you when they finish."
 echo ""
 echo "  Config (env vars in the webhook plist):"
 echo "    FORWARDER_MODEL=opus  FORWARDER_EFFORT=high  FORWARDER_WORKSPACE=~/claude"
@@ -224,5 +194,4 @@ echo "    FORWARDER_PROJECT_ROOTS=~/claude  FORWARDER_EXTRA_PROJECTS=  (project 
 echo ""
 echo "  To stop everything:"
 echo "    launchctl unload $WEBHOOK_PLIST_PATH"
-echo "    launchctl unload $MENUBAR_PLIST_PATH"
 echo ""

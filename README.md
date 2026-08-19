@@ -8,7 +8,7 @@ Press **Cmd+Shift+F** on a Gmail thread, Slack thread, Zendesk ticket, Jira issu
 |-------------|--------------|
 | **Claude Code** | Opens a new Claude Code Desktop session, task prefilled |
 | **Codex** | Opens a new Codex Desktop session, task prefilled |
-| **Background** | Runs a headless `claude -p` job and reports through the `✳` menu bar item |
+| **Background** | Runs a headless `claude -p` job and notifies you when it finishes |
 
 Desktop sessions open **inside a project directory you choose**, so the agent starts with that repository's `CLAUDE.md` / `AGENTS.md`, Git state, skills, and local context already loaded. The prompt is prefilled but never auto-submitted — you read it and press Enter.
 
@@ -35,14 +35,14 @@ Nothing leaves your machine except what the agent itself does. The webhook binds
 
 ## Requirements
 
-- **macOS** — launchd services and the menu bar app are macOS only
+- **macOS** — the launchd service and native notifications are macOS only
 - **Chrome, Arc, Brave, Edge, or another Chromium browser**
 - **Claude Desktop** for the Claude Code destination
 - **ChatGPT/Codex Desktop** for the Codex destination
 - **Claude Code CLI** for Background mode — [install guide](https://docs.anthropic.com/en/docs/claude-code)
 - **Slack in the browser** (`app.slack.com`) — extensions cannot inject into the standalone Slack app
 
-`setup.sh` installs the rest: tmux, a private Python venv with Flask and rumps, and both login services.
+`setup.sh` installs the rest: tmux, a private Python venv with Flask, and the webhook login service.
 
 ## Install
 
@@ -54,7 +54,7 @@ cd claude-code-forwarder
 ./setup.sh
 ```
 
-This starts the webhook and the `✳` menu bar app as login services, then runs a smoke test. You should see `✳ 1` in the menu bar for a few seconds, then `✳`.
+This starts the webhook as a login service, then runs a smoke test — a 5-second fake job that posts a "Forwarded job done" notification when it finishes.
 
 ### 2. Load the extension
 
@@ -125,17 +125,24 @@ Template buttons sit above the instruction box. Click one, or press its number k
 
 Edit the `TEMPLATES` list at the top of `extension/background.js` to change the buttons, then reload the extension.
 
-### The ✳ menu bar item
+### Background jobs
 
-| Title | Meaning |
-|-------|---------|
-| `✳` | Idle |
-| `◐ 2` | 2 jobs running; the icon spins while anything runs |
-| `◐ 2 +1` | 2 running, 1 queued |
-| `✳ ⚠1` | Idle, 1 recent job errored |
-| `✳ ⌁` | Webhook unreachable |
+Background jobs are headless by design — there is nothing to interact with mid-run — so they report in two places and nowhere else:
 
-Click it for each job with elapsed time, **Terminate** (kills the tmux session), **Cancel** (drops a queued job), and **View log**. Finished jobs stay listed for 6 hours or until you **Clear finished**. Background jobs are fully headless by design — there is nothing to interact with mid-run.
+1. **A notification when each job finishes**, titled "Forwarded job done", "failed", or "terminated", with the task subject. This is the only thing that interrupts you. Set `FORWARDER_NOTIFY=0` to turn it off.
+2. **A line in the popup** when something is in flight, so pressing Cmd+Shift+F also tells you what is still running.
+
+Up to version 1.6 a `✳` menu bar app polled for this. It was removed in 1.7.0: it queried the webhook every 3 seconds — about 28,000 requests a day — to render an icon that was blank almost all of the time. The webhook now sweeps its own jobs on a timer, so nothing external has to poll it.
+
+Inspect or control jobs directly when you need to:
+
+```bash
+curl -s http://localhost:5581/status | python3 -m json.tool   # running, queued, finished
+curl -s -X POST http://localhost:5581/terminate/<job_id>      # kill a running or queued job
+curl -s -X POST http://localhost:5581/clear-finished          # drop the recent-job list
+```
+
+`/status` carries each job's `log_path`; open it with `open -a Console <path>`. Finished jobs stay listed for 6 hours.
 
 At most `FORWARDER_MAX_CONCURRENT` (default 2) jobs run at once; the rest wait in a FIFO queue. This keeps concurrent sessions from racing each other's OAuth token refresh and from exhausting shared API rate limits. A job that exits non-zero retries up to 3 times (30s, then 60s backoff). Deliverables are always drafts, so a duplicate from a partial run is cheap; losing the forwarded content is not.
 
@@ -159,32 +166,32 @@ Set env vars in `~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist`
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `PORT` | `5581` | Webhook port; the menu bar app reads the same var |
+| `PORT` | `5581` | Webhook port |
 | `FORWARDER_WORKSPACE` | `~/claude` | General workspace: background jobs and the default desktop target |
 | `FORWARDER_PROJECT_ROOTS` | `FORWARDER_WORKSPACE` | Colon-separated roots the project selector may open, scanned two levels deep |
 | `FORWARDER_EXTRA_PROJECTS` | *(none)* | Colon-separated project dirs allowed outside the roots; exact match, subdirectories not included |
 | `FORWARDER_MODEL` | `opus` | Model for background sessions |
 | `FORWARDER_EFFORT` | `high` | Effort level for background sessions |
 | `FORWARDER_MAX_CONCURRENT` | `2` | Parallel background jobs; the rest queue FIFO |
+| `FORWARDER_NOTIFY` | `1` | Notify when a background job finishes; `0` disables |
 | `FORWARDER_PACKETS_DIR` | `~/Library/Application Support/Claude Code Forwarder/Inbox` | Private work packets |
 | `FORWARDER_PACKET_TTL_DAYS` | `30` | Delete packets older than this; `0` disables pruning |
 
 If all your repos live under `~/claude`, you do not need to set anything. Point `FORWARDER_PROJECT_ROOTS` at your code directories if they live elsewhere, for example `~/code:~/work`.
 
+**Upgrading to 1.7.0.** Re-run `./setup.sh`; it unloads and removes the retired menu bar service for you. Background jobs now notify you when they finish instead. Nothing else changes, and no config is needed.
+
 **Upgrading from 1.5 or earlier.** No config change required. Restart the webhook service and reload the extension to get the project selector. Payloads without a `workspace` — old clients included — keep opening in `FORWARDER_WORKSPACE` exactly as before.
 
-**Services:**
+**Service:**
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
 launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
-launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
-launchctl load   ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
 ```
 
-**Logs:**
+**Log:**
 ```bash
 tail -f /tmp/claude-forwarder-webhook.log
-tail -f /tmp/claude-forwarder-menubar.log
 ```
 
 **Smoke test** (5-second fake job, no Claude involved):
@@ -225,19 +232,23 @@ Without these the agent still reads the forwarded DOM content, but cannot fetch 
 │  service worker → POST    │
 └───────────┬──────────────┘
             │ localhost:5581 (no CORS; extension only)
-┌───────────▼──────────────┐      ┌──────────────────────────┐
-│   Flask Webhook           │◄─────│   ✳ Menu Bar App (rumps)  │
-│                           │ poll │                           │
-│  POST /forward            │ 3s   │  • running/queued/done/err│
-│    → validate workspace   │      │  • Terminate / Cancel     │
-│    → private work packet  │      │  • View job log           │
-│      + native deep link   │      └──────────────────────────┘
+┌───────────▼──────────────┐
+│   Flask Webhook           │
+│                           │
+│  POST /forward            │
+│    → validate workspace   │
+│    → private work packet  │
+│      + native deep link   │
 │    OR queue + claude -p   │
 │  GET  /projects           │
 │  POST /projects/validate  │
 │  GET  /status             │
 │  POST /terminate/<id>     │
 │  POST /clear-finished     │
+│                           │
+│  sweeper thread (5s):     │
+│    finish → notify        │
+│    free slot → next job   │
 └─────┬──────────────┬─────┘
       │              │ headless tmux session
       │              │ (auto-retry ×3)
@@ -250,7 +261,7 @@ Without these the agent still reads the forwarded DOM content, but cannot fetch 
 │  New session│  │  • Draft-first flow       │
 │  in the     │  │  • Result → draft/board,  │
 │  chosen     │  │    never just the log     │
-│  project    │  │  exit code → job status   │
+│  project    │  │  exit code → notification │
 └─────────────┘  └──────────────────────────┘
 ```
 
@@ -275,8 +286,12 @@ Set the shortcut to **Global** in `chrome://extensions/shortcuts`. "In Chrome" /
 **Popup says "Connection failed"**
 The webhook is not running. Check `curl http://localhost:5581/status` and restart the service.
 
-**`✳` shows `⌁`**
-Same cause — the menu bar app cannot reach the webhook. Check the webhook log.
+**No notification when a background job finishes**
+Check that notifications are allowed for Script Editor in System Settings → Notifications, and that a Focus mode is not suppressing them. Verify the path directly:
+```bash
+osascript -e 'display notification "test" with title "Forwarder"'
+```
+`FORWARDER_NOTIFY=0` also disables them. The job itself is unaffected — its result still lands in the draft or dashboard, and `/status` shows the outcome.
 
 **Project dropdown says "Project list unavailable"**
 The webhook is unreachable. Forwards still work and open in the General workspace.
@@ -300,8 +315,7 @@ DOM selectors may be outdated. The extension falls back to URL-only mode; for Sl
 
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
-launchctl unload ~/Library/LaunchAgents/com.claude-code-forwarder.menubar.plist
-rm ~/Library/LaunchAgents/com.claude-code-forwarder.{webhook,menubar}.plist
+rm ~/Library/LaunchAgents/com.claude-code-forwarder.webhook.plist
 
 rm -rf ~/claude-code-forwarder   # or wherever you cloned it
 ```

@@ -73,6 +73,17 @@ function healthyBackend(overrides = {}) {
         }),
       };
     }
+    if (url.endsWith("/status")) {
+      if (overrides.statusOk === false) throw new Error("ECONNREFUSED");
+      return {
+        json: async () => ({
+          ok: true,
+          active_jobs: overrides.running ?? 0,
+          queued_jobs: overrides.queued ?? 0,
+          error_jobs: overrides.errors ?? 0,
+        }),
+      };
+    }
     if (url.endsWith("/forward")) {
       const body = JSON.parse(options.body);
       return {
@@ -284,6 +295,22 @@ async function main() {
 
   // unknown messages are ignored synchronously (channel not held open)
   assert.equal(runtimeListener({ type: "ignored" }, {}, () => {}), false);
+
+  // ── background job status (replaces the ✳ menu bar poller) ────
+  fetchHandler = healthyBackend({ running: 2, queued: 1, errors: 3 });
+  const jobs = await context.fetchBackgroundJobs();
+  assert.deepEqual(plain(jobs), { running: 2, queued: 1, errors: 3 });
+
+  fetchHandler = healthyBackend();
+  assert.deepEqual(
+    plain(await context.fetchBackgroundJobs()),
+    { running: 0, queued: 0, errors: 0 },
+    "idle backend reports zeroes, not null",
+  );
+
+  // webhook down must not throw — the popup simply omits the line
+  fetchHandler = healthyBackend({ statusOk: false });
+  assert.equal(await context.fetchBackgroundJobs(), null);
 
   console.log("extension project selector: ok");
 }

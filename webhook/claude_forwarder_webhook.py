@@ -3,7 +3,9 @@
 Claude Code Forwarder Webhook
 Receives forwarded Gmail/Slack threads and Plaud recordings from the Chrome
 extension, spawns headless Claude Code CLI sessions in tmux, and tracks their
-lifecycle (running / done / error / terminated) for the menu bar app.
+lifecycle (running / done / error / terminated). Background jobs announce
+themselves with a macOS notification when they finish; /status carries the
+same state for the extension popup.
 
 Usage:
   pip install -r requirements.txt
@@ -19,6 +21,7 @@ Environment overrides:
   FORWARDER_MODEL           model for spawned sessions      (default opus)
   FORWARDER_EFFORT          effort for spawned sessions     (default high)
   FORWARDER_MAX_CONCURRENT  parallel jobs; rest queue FIFO  (default 2)
+  FORWARDER_NOTIFY          notify when a background job ends (default 1)
 """
 
 import os
@@ -90,8 +93,19 @@ CLAUDE_EFFORT = os.environ.get("FORWARDER_EFFORT", "high")
 # Per-job artifacts: <session>.exit (exit code) and <session>.log (output)
 JOBS_DIR = "/tmp/claude-forwarder-jobs"
 
-# How long finished jobs stay listed in /status (menu bar history)
+# How long finished jobs stay listed in /status (recent-job history)
 FINISHED_TTL = 6 * 3600
+
+# Background jobs are headless, so the only thing worth interrupting the user
+# for is "it finished". One notification per job replaces the old always-on
+# menu bar poller.
+NOTIFY_ON_FINISH = os.environ.get("FORWARDER_NOTIFY", "1") not in ("0", "false", "no")
+
+NOTIFY_TITLES = {
+    "done": "Forwarded job done",
+    "error": "Forwarded job failed",
+    "terminated": "Forwarded job terminated",
+}
 
 # Concurrent Claude instances racing each other caused transient OAuth
 # refresh failures; also protects shared API budgets (Zendesk etc.).
@@ -105,7 +119,7 @@ queued_jobs = {}    # job_id -> job dict, status == "queued" (holds prompt)
 queue_order = []    # FIFO of queued job_ids
 finished_jobs = {}  # job_id -> job dict, status in ("done","error","terminated")
 
-# Flask serves requests on multiple threads; the menu bar polls /status
+# Flask serves requests on multiple threads; the popup reads /status
 # while /terminate mutates the same dicts — serialize all job bookkeeping
 jobs_lock = threading.Lock()
 
@@ -460,7 +474,7 @@ def launch_in_tmux(session_name, prompt, test_mode=False):
 
     claude runs in print mode (-p): it works the task autonomously, then
     exits. Exit code lands in JOBS_DIR/<session>.exit, output in .log —
-    that's what /status and the menu bar app read. Nobody attaches to
+    that's what /status and the finish notification read. Nobody attaches to
     these sessions; tmux is just a detach + kill handle.
     """
     os.makedirs(JOBS_DIR, exist_ok=True)
@@ -545,6 +559,74 @@ def list_forwarder_tmux_sessions():
     return [s for s in result.stdout.splitlines() if s.startswith("fwd-")]
 
 
+# Until 1.7.0 the menu bar app polled /status every few seconds, and that
+# poll was what actually drove refresh_jobs(). With the menu bar gone the
+# webhook has to sweep itself, or a finished job would go unnoticed — and,
+# worse, a queued job would never start — until the next HTTP request.
+SWEEP_SECONDS = 5
+
+
+def sweep_jobs_forever(interval=SWEEP_SECONDS, stop_event=None):
+    """Advance job bookkeeping on a timer: finish, notify, launch queued."""
+    while not (stop_event and stop_event.is_set()):
+        time.sleep(interval)
+        try:
+            with jobs_lock:
+                # Nothing in flight and nothing waiting: no work to do.
+                if not active_jobs and not queue_order:
+                    continue
+                refresh_jobs()
+        except Exception:
+            # A sweep must never kill the thread; the next tick retries.
+            continue
+
+
+def start_job_sweeper():
+    thread = threading.Thread(
+        target=sweep_jobs_forever, name="forwarder-job-sweeper", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def notify_job_finished(job):
+    """Post one macOS notification for a finished background job.
+
+    Best-effort and non-blocking: callers hold jobs_lock, so this must never
+    wait on a subprocess or raise. The AppleScript is a fixed string and all
+    job-derived text is passed as argv, so nothing is interpolated into a
+    script or a shell.
+    """
+    if not NOTIFY_ON_FINISH:
+        return
+    status = job.get("status", "done")
+    subject = (job.get("subject") or job.get("source") or "Forwarded task").strip()
+    if len(subject) > 90:
+        subject = subject[:89] + "…"
+    # macOS renders title, then subtitle, then body — so the human-meaningful
+    # subject goes in the subtitle and the session name in the body.
+    try:
+        subprocess.Popen(
+            [
+                "osascript",
+                "-e", "on run argv",
+                "-e", (
+                    "display notification (item 3 of argv) "
+                    "with title (item 1 of argv) subtitle (item 2 of argv)"
+                ),
+                "-e", "end run",
+                NOTIFY_TITLES.get(status, "Forwarded job finished"),
+                subject,
+                job.get("session_name", ""),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # A missing/failing osascript must never stall job bookkeeping.
+        pass
+
+
 def refresh_jobs():
     """Move exited jobs to finished, recover orphans, launch queued jobs.
 
@@ -574,6 +656,7 @@ def refresh_jobs():
             job["status"] = "error"
         finished_jobs[job_id] = job
         active_jobs.pop(job_id, None)
+        notify_job_finished(job)
 
     # 2. Orphaned fwd-* tmux sessions (webhook restarted mid-job) → adopt
     known = {j["session_name"] for j in active_jobs.values()}
@@ -856,5 +939,7 @@ if __name__ == "__main__":
     print(f"  Model:     {CLAUDE_MODEL} (effort: {CLAUDE_EFFORT})")
     print(f"  Parallel:  {MAX_CONCURRENT} (excess jobs queue FIFO)")
     print(f"  Jobs dir:  {JOBS_DIR}")
+    print(f"  Notify:    {'on' if NOTIFY_ON_FINISH else 'off'} (background job finished)")
     print("=" * 50)
+    start_job_sweeper()
     app.run(host="127.0.0.1", port=port)
