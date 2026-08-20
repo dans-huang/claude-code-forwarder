@@ -123,7 +123,9 @@ Template buttons sit above the instruction box. Click one, or press its number k
 | **Shift+Enter** | New line |
 | **Esc** | Cancel |
 
-Edit the `TEMPLATES` list at the top of `extension/background.js` to change the buttons, then reload the extension.
+Paste works inside the popup even on pages that normally hijack it (Slack, Gmail): clipboard events are shielded from the host page while the popup is open, and if the page steals focus the pasted text is routed into the popup field anyway.
+
+Edit the `TEMPLATES` list at the top of `extension/background.js` to change the buttons, then reload the extension. A template may carry `project: "general"` — picking it pins the project selector to the General workspace (used by the QA-dashboard macro, whose skill and files live there). The pin is not remembered for the site, and you can still change the project before sending.
 
 ### Background jobs
 

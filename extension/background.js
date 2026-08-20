@@ -233,15 +233,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 // Template prompts shown as quick-select buttons in the popup, in priority
 // order. Click one to fill the instruction box (still editable), then Enter
-// to send. Edit this list to customize.
+// to send. An optional `project: "general"` pins the project selector to the
+// General workspace when the template is picked — for tasks whose skills and
+// files live there. Edit this list to customize.
 const TEMPLATES = [
   {
     label: "Research → Slack draft",
     text: "Research this thoroughly, then draft a response right back in Slack for my later review. Draft only — never send.",
   },
   {
-    label: "Update QA dashboard",
-    text: "Update this task into the QA dashboard. Ensure highest clarity and reduce noise — keep only what matters, remove anything stale it supersedes.",
+    label: "Update QA test-plan dashboard",
+    text: "Update the QA test-plan dashboard with this. First read ~/claude/skills/qa-dashboard-update.md and follow it end to end: fetch the complete source (full Slack thread / mail) before deciding anything, update projects/qa-test-schedule/dashboard.html in both languages, prune stale items in the same pass, verify, and publish to the existing artifact URL named in the skill. Dashboard edits and publishing are pre-approved — finish and report without asking.",
+    project: "general",
   },
   {
     label: "Draft email reply",
@@ -626,6 +629,11 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
     projectSelect.appendChild(chooseOption);
   }
 
+  // True while the selection was made by a template pin, not by the user.
+  // A pinned forward must not touch the per-site memory: using a macro once
+  // is not a statement about where this site's tasks belong.
+  let projectPinnedByTemplate = false;
+
   function currentProject() {
     if (!ctx) return null;
     const value = projectSelect.value;
@@ -633,7 +641,11 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
       return { path: ctx.auto.path, name: ctx.auto.name, explicit: false };
     }
     if (value === "__general__") {
-      return { path: ctx.general.path, name: ctx.general.name, explicit: true };
+      return {
+        path: ctx.general.path,
+        name: ctx.general.name,
+        explicit: !projectPinnedByTemplate,
+      };
     }
     if (value === "__choose__") return null;
     return { path: value, name: projectNames[value] || value, explicit: true };
@@ -693,7 +705,10 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
     projectSelect.focus();
   }
 
-  projectSelect.addEventListener("change", updateProjectDisplay);
+  projectSelect.addEventListener("change", () => {
+    projectPinnedByTemplate = false; // a manual change is the user's choice
+    updateProjectDisplay();
+  });
 
   projectClearBtn.addEventListener("click", async () => {
     try {
@@ -775,6 +790,13 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
     if (!tpl) return;
     textarea.value = tpl.text;
     tplButtons.forEach((b, j) => b.classList.toggle("active", i === j));
+    // A template that belongs to the general workspace pins the project
+    // selector there (the user can still change it afterwards).
+    if (tpl.project === "general" && ctx && !projectSelect.disabled) {
+      projectSelect.value = "__general__";
+      projectPinnedByTemplate = true;
+      updateProjectDisplay();
+    }
     textarea.focus();
   }
 
@@ -843,16 +865,55 @@ function injectInstructionPopup(source, url, extracted, templates, destinations,
     }
     e.stopPropagation();
   }
-  document.addEventListener("keydown", blockSlackKeys, true);
-  document.addEventListener("keyup", blockSlackKeys, true);
-  document.addEventListener("keypress", blockSlackKeys, true);
+  // Register at the WINDOW capture stage, not document: capture runs
+  // window → document → …, so this beats the host page's own document-level
+  // handlers (Slack, Gmail) no matter how early the page registered them.
+  window.addEventListener("keydown", blockSlackKeys, true);
+  window.addEventListener("keyup", blockSlackKeys, true);
+  window.addEventListener("keypress", blockSlackKeys, true);
+
+  // Clipboard: host pages intercept paste at the document level and route it
+  // into their own composer, so pasting into the popup landed on the page
+  // instead. Shield clipboard events the same way. stopPropagation (never
+  // preventDefault) lets the browser's default paste land in the focused
+  // popup field; if the page stole focus, the text is inserted manually so
+  // the page never receives it.
+  let lastPopupField = textarea;
+  shadow.addEventListener("focusin", (e) => {
+    if (e.target === textarea || e.target === customInput) {
+      lastPopupField = e.target;
+    }
+  });
+
+  function trapClipboard(e) {
+    if (!document.getElementById("claude-forwarder-popup")) return;
+    e.stopPropagation();
+    if (e.type !== "paste") return;
+    const target = e.composedPath ? e.composedPath()[0] : e.target;
+    if (target === textarea || target === customInput) return;
+    e.preventDefault();
+    const text = e.clipboardData?.getData("text/plain");
+    if (!text) return;
+    const field =
+      customBox.style.display !== "none" ? customInput : lastPopupField;
+    const start = field.selectionStart ?? field.value.length;
+    const end = field.selectionEnd ?? field.value.length;
+    field.setRangeText(text, start, end, "end");
+    field.focus();
+  }
+  window.addEventListener("paste", trapClipboard, true);
+  window.addEventListener("cut", trapClipboard, true);
+  window.addEventListener("copy", trapClipboard, true);
 
   // Clean up event listeners when popup is removed
   const observer = new MutationObserver(() => {
     if (!document.getElementById("claude-forwarder-popup")) {
-      document.removeEventListener("keydown", blockSlackKeys, true);
-      document.removeEventListener("keyup", blockSlackKeys, true);
-      document.removeEventListener("keypress", blockSlackKeys, true);
+      window.removeEventListener("keydown", blockSlackKeys, true);
+      window.removeEventListener("keyup", blockSlackKeys, true);
+      window.removeEventListener("keypress", blockSlackKeys, true);
+      window.removeEventListener("paste", trapClipboard, true);
+      window.removeEventListener("cut", trapClipboard, true);
+      window.removeEventListener("copy", trapClipboard, true);
       observer.disconnect();
     }
   });
